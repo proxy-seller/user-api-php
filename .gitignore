@@ -1,0 +1,4 @@
+vendor/
+nbproject/
+debug.php
+/composer.lock

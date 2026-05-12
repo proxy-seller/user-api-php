@@ -1,0 +1,21 @@
+{
+    "name": "proxy-seller/user-api-php",
+    "description": "Interaction with user api",
+    "type": "library",
+    "homepage": "https://github.com/proxy-seller/user-api-php",
+    "require": {
+        "php": "^7.2.5 || ^8.0",
+        "guzzlehttp/guzzle": "^7.0"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "ProxySeller\\Userapi\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "proxy-seller"
+        }
+    ]
+}
