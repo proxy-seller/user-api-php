@@ -34,17 +34,14 @@ echo $api->balance();
 
 `baseUrl` must include `/personal/api/v2/`. You may inject an already configured Guzzle-compatible client through the `client` option; this is useful for a custom transport, tracing, TLS settings or local stubs.
 
-`setPaymentId()` remains available, but stable codes are safer when database IDs differ between environments. Note that codes are resolved on order/prolong endpoints only — see [Balance and auto top-up](#balance-and-auto-top-up).
+`setPaymentId()` remains available, but stable codes are safer when database IDs differ between environments. Two caveats: codes are resolved on order/prolong endpoints only (see [Balance and auto top-up](#balance-and-auto-top-up)), and `balance/payments/list` returns ids and names but no codes — see [What you can pass, and where to get it](#what-you-can-pass-and-where-to-get-it).
 
 ## IDs in v2 are strings, not numbers
 
 Every identifier the API returns — `orderId`, IP address ids, auth ids, `paymentId` — is a MongoDB **ObjectId**: a 24-character hex string such as `66f0c2a1b4d3e5f6a7b8c9d0`. Do not cast them to `int`, do not compare them numerically, and store them as strings:
 
 ```php
-$order = $api->orderMakeIpv4(null, null, 1, null, null, 'my target', [
-    'countryCode' => 'USA',
-    'periodCode'  => '1m',
-]);
+$order = $api->orderMakeIpv4('USA', '1m', 1, null, null, 'my target');
 
 $orderId = $order['orderId'];          // string, keep it as a string
 $proxies = $api->proxyList('ipv4', ['orderId' => $orderId]);
@@ -56,39 +53,63 @@ Casting to `int` truncates an ObjectId to a meaningless number (often `0`), whic
 
 ## Current order API
 
-Existing helpers keep their old positional arguments and accept an optional final options array:
+Every `*Id` argument accepts **either** an ObjectId **or** the matching stable code. The server tries
+the value as an id first and falls back to a code lookup when it is not a valid id
+(`ClientApiService.normalizeOrderReferenceCodes`). Codes therefore go in **positionally** — there is
+no need for a chain of `null`s and an options array just to carry them:
 
 ```php
+// referenceList('mobile') returns ['items' => <section>]; without a type it returns a map of sections
+$section  = $api->referenceList('mobile')['items'];
+$operator = $section['country'][0]['operators']['dedicated'][0];
+// $operator = ['id' => '66f0…', 'name' => '…', 'rotations' => [['id' => 5, 'name' => '5 minutes'], …]]
+
 $mobile = $api->orderCalcMobile(
-    null,
-    null,
-    1,
-    null,
-    null,
-    null,
-    null,
-    'dedicated', // shared or dedicated; required for mobile
-    [
-        'countryCode' => 'USA',
-        'periodCode' => '1m',
-        'operatorCode' => 'operator-code',
-        'rotationCode' => '5m',
-    ]
+    'USA',              // countryId: ObjectId or country code (alpha3)
+    '1m',               // periodId: ObjectId or period code
+    1,                  // quantity
+    null,               // authorization — optional
+    null,               // coupon — optional
+    $operator['id'],    // operatorId: ObjectId (or the operator tag, which the reference never returns)
+    5,                  // rotationId: MINUTES, 0 = By Link. Not a code — '5m' is rejected
+    'dedicated'         // shared or dedicated; required for mobile
 );
 
-$mix = $api->orderCalcMix(null, null, 10, null, null, null, [
-    'mixCode' => 'mix-code',
-    'periodCode' => '1m',
-]);
+$uptime = $api->orderCalcIpv4('USA', '1m', 1, null, null, 'my target', ['uptime' => true]);
 
-$uptime = $api->orderCalcIpv4(null, null, 1, null, null, null, [
-    'countryCode' => 'USA',
-    'periodCode' => '1m',
-    'uptime' => true,
-]);
+$mixId = $api->referenceList('mix')['items']['quantities'][0]['id'];
+$mix   = $api->orderCalcMix(null, '1m', 10, null, null, null, ['mixId' => $mixId]);
 ```
 
-Options support all current fields: ID/code pairs for country, period, payment, MIX, operator, rotation and resident tariff, plus `protocol`, `mobileServiceType`, `uptime` and `generateAuth`. A supplied stable code removes the paired environment-specific ID.
+The remaining `null`s above are genuine optional values (`authorization`, `coupon`), not placeholders.
+
+The final options array is for fields **without** a positional argument: `uptime`, `mixId`/`mixCode`,
+`generateAuth`, and `protocol` outside the IPv6 helpers. The explicit `*Code` keys (`countryCode`,
+`periodCode`, `operatorCode`, `mixCode`, `tarifCode`, `paymentCode`) still work and win over the
+paired `*Id`, so use them when a self-documenting payload matters more than a short call.
+
+**`rotationCode` is a trap.** It is the one field without a code lookup: the server checks that the
+value is an integer and copies it into `rotationId` unchanged, so `'5m'` fails with
+`Set existed [rotationCode] from reference` and nothing else happens. Pass the number of minutes —
+in `rotationId`, which is what `rotationCode` would become anyway.
+
+### What you can pass, and where to get it
+
+`reference/list` does **not** return a code for every field. Where it does not, the ObjectId from the
+reference is the only value you can discover programmatically:
+
+| Argument | Accepts | Where the value comes from |
+| --- | --- | --- |
+| `countryId` | ObjectId **or** country code — upper-cased server-side | `reference/list` → `country[].id`; the code is `country[].alpha3` — the one code the reference really gives you |
+| `periodId` | ObjectId **or** period code — lower-cased server-side | `reference/list` → `period[].id` only. **No code in the response** — `1m`/`3m` are values you already know, not something you can read from the reference |
+| `operatorId` | ObjectId **or** operator tag — exact match | `reference/list/mobile` → `country[].operators.dedicated[].id` / `.shared[].id`. **The tag is not returned** |
+| `rotationId` | **Minutes, integer.** `0` = By Link. Codes do not exist here | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that id *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
+| `mixId` (options) | ObjectId **or** package tag — exact match. The `countryId` shortcut (`"packageId:quantity"`) takes the **ObjectId only**, it is looked up by id | `reference/list/mix` → `quantities[].id`. The tag appears only as `country[].tag` of the same section, next to the same id |
+| `tarifId` | ObjectId **or** tariff code — exact match | `reference/list/resident` → `items.tarifs[].id` (plus `name`). **No code field** |
+| `paymentId` / `setPaymentCode()` | ObjectId **or** payment code (`PaymentSystem.code`, or a type name such as `balance`) — on order/prolong endpoints only | `balance/payments/list` → `items[].id`. **No code field**, and `balance/add` resolves neither |
+
+Codes are resolved by `order/calc`, `order/make`, `prolong/calc` and `prolong/make` only. Every other
+endpoint takes ids.
 
 `ipv4`, `ipv6`, `isp` and an unresolved `mix` order require a goal (`customTargetName`); the SDK checks this locally so the server does not have to answer `Incorrect goal` (code 14). A `mix` order counts as resolved without a goal when `mixId`/`mixCode` is set, or `countryId` holds a `packageId:quantity` pair, or `countryId` comes together with `quantity > 0`.
 
@@ -201,7 +222,7 @@ Valid reasons: `NOT_WORK`, `INCORRECT_LOCATION`, `CANT_CHANGE_NETWORK`, `LOW_SPE
 - `residentGeo()` returns a **JSON** file (`geo.json`) with the full geo tree — countries, regions, cities, ISPs — and `residentGeoIsp()` returns `isp.json`. Neither is a zip archive.
 - `ext` on the download endpoints is `txt`, `csv` or a custom line template built from `%ip%`, `%port%`, `%login%`, `%user%`, `%password%`, `%protocol%`, `%rotation_link%`. It must be at most 250 characters and must not contain CR, LF, `/` or `\` — the server rejects those with a bare plain-text HTTP 400 outside the envelope, so the SDK validates it first. `ext` may be given positionally or inside the `$filters` array.
 - `package_key` works only on `proxyDownload('subresident', ...)`. The literal `/proxy/download/resident` route ignores it and would export the parent package instead, so passing it there throws.
-- `prolongCalc` / `prolongMake` accept a final options array with `orderSeparatorIds`, `orderSeparatorId`, `periodCode`, `paymentCode` and the full ID payload.
+- `prolongCalc` / `prolongMake` resolve codes the same way as the order endpoints, so the positional `$periodId` takes a period code as well: `prolongCalc('ipv4', $ids, '1m')`. The final options array adds `orderSeparatorIds`, `orderSeparatorId`, and the `periodCode` / `paymentCode` twins.
 - `residentList()` returns `data` as a flat array of lists — there is no `items` wrapper.
 - `residentTrafficDetails()` takes the package key as `packageKey` **or** `key` (plus optional `login`, `date_start`, `date_end`). `package_key`, the name used across `residentsubuser/*`, is not accepted there and yields `key is required`.
 - `residentPackage()` reports `expired_at` as a string (`d.m.Y H:i:s`), while `residentSubUserPackages()` reports it as a PHP date **object** — read `$item['expired_at']['date']`.

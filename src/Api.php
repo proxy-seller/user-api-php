@@ -101,8 +101,10 @@ class Api {
     }
 
     /**
-     * Payment system id (MongoDB ObjectId from balance/payments/list)
-     * @param string $paymentId
+     * Payment system id (MongoDB ObjectId from balance/payments/list).
+     * На order/prolong сервер принимает здесь и код (тот же фолбэк, что для paymentCode),
+     * но balance/add коды не резолвит — для него нужен именно ObjectId.
+     * @param string $paymentId ObjectId, or a payment code on the order/prolong endpoints
      * @return void
      */
     public function setPaymentId($paymentId): void {
@@ -115,6 +117,9 @@ class Api {
     /**
      * Stable payment system code, for example "balance".
      * Codes are preferred to environment-specific MongoDB ids.
+     * Значение — PaymentSystem.code либо имя типа (balance, paddle_subscription): в
+     * balance/payments/list кода нет, оттуда приходят только id и name.
+     * Резолвится только на order/calc, order/make, prolong/calc и prolong/make.
      * @param string $paymentCode
      * @return void
      */
@@ -516,6 +521,21 @@ class Api {
 
     /**
      * Necessary guides for creating an order
+     *
+     * Форма ответа: referenceList('mobile') отдаёт ['items' => <объект раздела>], а
+     * referenceList() без типа — карту разделов, ['ipv4' => <объект>, 'mobile' => <объект>, ...].
+     *
+     * Что реально лежит в объекте раздела:
+     *   country[]     id, name, alpha3 — alpha3 это ЕДИНСТВЕННЫЙ код, который отдаёт справочник
+     *   period[]      id, name — кода периода здесь нет
+     *   mobile        country[].operators.{dedicated,shared}[] → id, name,
+     *                 rotations[{id, name}], где rotations[].id — это МИНУТЫ (0 = "By Link");
+     *                 тега оператора в ответе нет
+     *   mix           quantities[] → id, name, quantities[]; тег пакета виден только как
+     *                 country[].tag того же раздела
+     *   resident      список тарифов → id, name; кода тарифа нет
+     * Кода платёжной системы нет и в balance/payments/list — там только id и name.
+     *
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @return array
      */
@@ -525,12 +545,13 @@ class Api {
 
     /**
      * Calculate the order IPv4
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for ipv4 (see assertTargetName)
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderCalcIpv4($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -539,12 +560,13 @@ class Api {
 
     /**
      * Calculate the order ISP
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for isp (see assertTargetName)
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderCalcIsp($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -553,12 +575,15 @@ class Api {
 
     /**
      * Calculate the order MIX
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId, country code, or the MIX package: its ObjectId (with
+     *                          quantity) or "packageObjectId:quantity". A package TAG works only
+     *                          through mixId/mixCode — parseMixSelection looks countryId up by id
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName not needed once the MIX package is resolved (see isMixResolved)
+     * @param array $options mixId/mixCode live here — there is no positional argument for them
      * @return array
      */
     function orderCalcMix($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -567,13 +592,14 @@ class Api {
 
     /**
      * Calculate the order IPv6
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for ipv6 (see assertTargetName)
      * @param string $protocol HTTPS | SOCKS5
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderCalcIpv6($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $protocol = null, $options = []) {
@@ -582,13 +608,20 @@ class Api {
 
     /**
      * Calculate the order Mobile
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     *
+     * Коды передаются ПОЗИЦИОННО, цепочка null и options ради них не нужны:
+     *   orderCalcMobile('USA', '1m', 1, null, null, $operatorId, 5, 'dedicated');
+     * Оставшиеся null здесь — законные необязательные authorization и coupon.
+     *
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $operatorId
-     * @param string $rotationId
+     * @param string $operatorId ObjectId or operator tag; reference/list publishes only the ObjectId
+     * @param integer $rotationId rotation in MINUTES (0 = By Link). Not a code — "5m" is rejected
+     * @param string $mobileServiceType shared | dedicated, required for mobile
+     * @param array $options fields without a positional argument (generateAuth, *Code twins)
      * @return array
      */
     function orderCalcMobile($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $operatorId = null, $rotationId = null, $mobileServiceType = 'dedicated', $options = []) {
@@ -597,8 +630,9 @@ class Api {
 
     /**
      * Calculate the order Resident
-     * @param string $tarifId
+     * @param string $tarifId ObjectId or tariff code; reference/list publishes only the ObjectId
      * @param string $coupon
+     * @param array $options fields without a positional argument (generateAuth, paymentCode, ...)
      * @return array
      */
     function orderCalcResident($tarifId, $coupon = null, $options = []) {
@@ -607,12 +641,13 @@ class Api {
 
     /**
      * Create an order IPv4. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for ipv4 (see assertTargetName)
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderMakeIpv4($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -621,12 +656,13 @@ class Api {
 
     /**
      * Create an order ISP. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for isp (see assertTargetName)
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderMakeIsp($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -635,12 +671,15 @@ class Api {
 
     /**
      * Create an order MIX. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId, country code, or the MIX package: its ObjectId (with
+     *                          quantity) or "packageObjectId:quantity". A package TAG works only
+     *                          through mixId/mixCode — parseMixSelection looks countryId up by id
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName not needed once the MIX package is resolved (see isMixResolved)
+     * @param array $options mixId/mixCode live here — there is no positional argument for them
      * @return array
      */
     function orderMakeMix($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
@@ -649,13 +688,14 @@ class Api {
 
     /**
      * Create an order IPv6. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $customTargetName
+     * @param string $customTargetName required for ipv6 (see assertTargetName)
      * @param string $protocol HTTPS | SOCKS5
+     * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
      * @return array
      */
     function orderMakeIpv6($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $protocol = null, $options = []) {
@@ -664,13 +704,18 @@ class Api {
 
     /**
      * Create an order Mobile. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId or country code
-     * @param string $periodId ObjectId or period code
+     *
+     * Пример: orderMakeMobile('USA', '1m', 1, null, null, $operatorId, 5, 'dedicated');
+     *
+     * @param string $countryId ObjectId or country code (alpha3, e.g. "USA")
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $operatorId
-     * @param string $rotationId
+     * @param string $operatorId ObjectId or operator tag; reference/list publishes only the ObjectId
+     * @param integer $rotationId rotation in MINUTES (0 = By Link). Not a code — "5m" is rejected
+     * @param string $mobileServiceType shared | dedicated, required for mobile
+     * @param array $options fields without a positional argument (generateAuth, *Code twins)
      * @return array
      */
     function orderMakeMobile($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $operatorId = null, $rotationId = null, $mobileServiceType = 'dedicated', $options = []) {
@@ -679,8 +724,9 @@ class Api {
 
     /**
      * Create an order Resident. Attention! Deducts money from the balance.
-     * @param string $tarifId
+     * @param string $tarifId ObjectId or tariff code; reference/list publishes only the ObjectId
      * @param string $coupon
+     * @param array $options fields without a positional argument (generateAuth, paymentCode, ...)
      * @return array
      */
     function orderMakeResident($tarifId, $coupon = null, $options = []) {
@@ -742,6 +788,26 @@ class Api {
         return $options;
     }
 
+    /**
+     * Мержит options в тело заказа и убирает *Id, если пришёл парный непустой *Code.
+     *
+     * Как сервер разбирает id и коды (ClientApiService.normalizeOrderReferenceCodes):
+     *  - countryId, periodId, operatorId, mixId, tarifId, paymentId принимают ObjectId ЛИБО код:
+     *    если значение не является валидным id, а парный *Code пуст, сервер резолвит его КАК КОД.
+     *    Значит код можно передавать позиционно прямо в *Id-аргумент — options и цепочка null
+     *    ради этого не нужны. Регистр: countryId/countryCode приводится к UPPER, periodId/periodCode
+     *    к lower, operatorId (tag), mixId (tag) и tarifId (code) сравниваются точно.
+     *  - rotationId — это ЧИСЛО МИНУТ (0 = By Link), кодов у ротации не существует.
+     *    rotationCode — единственное поле без резолва: сервер требует целое число и копирует его
+     *    в rotationId как есть, поэтому строка вида "5m" в rotationCode гарантированно даёт
+     *    "Set existed [rotationCode] from reference". Передавайте минуты числом в rotationId.
+     *  - Коды резолвятся только на order/calc, order/make, prolong/calc и prolong/make. Остальные
+     *    эндпоинты (в том числе balance/add) принимают исключительно id.
+     *
+     * @param array $request
+     * @param array|boolean|null $options
+     * @return array
+     */
     protected function applyOrderOptions($request, $options) {
         $allowed = [
             'countryId', 'countryCode', 'sectionCode', 'periodId', 'periodCode',
@@ -923,8 +989,9 @@ class Api {
      * Calculate the renewal
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix
      * @param array $ids
-     * @param string $periodId
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param string $coupon
+     * @param array $options orderSeparatorIds, orderSeparatorId, periodCode, paymentCode
      * @return array
      */
     function prolongCalc($type, $ids, $periodId, $coupon = '', $options = []) {
@@ -935,8 +1002,9 @@ class Api {
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp
      * @param array $ids
-     * @param string $periodId
+     * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param string $coupon
+     * @param array $options orderSeparatorIds, orderSeparatorId, periodCode, paymentCode
      * @return array ['orderId' => ObjectId-строка, 'total' => …, 'balance' => …, 'listBaseOrderNumbers' => []]
      * @throws ApiException при нехватке средств — продление НЕ состоялось
      */

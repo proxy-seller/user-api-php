@@ -73,9 +73,14 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
   `residentSubUserDelete()`, `residentSubUserPackages()`, `residentSubUserLists()`,
   `residentSubUserListAdd()`, `residentSubUserListRename()`, `residentSubUserListRotation()`,
   `residentSubUserListTools()`, `residentSubUserListDelete()`.
-- Stable reference codes instead of environment-specific ids: `setPaymentCode()` plus
-  `countryCode`, `periodCode`, `mixCode`, `operatorCode`, `rotationCode`, `tarifCode`,
-  `paymentCode` in the order/prolong options array.
+- Stable codes instead of environment-specific ids on the order/prolong endpoints:
+  `setPaymentCode()` plus `countryCode`, `periodCode`, `mixCode`, `operatorCode`, `tarifCode` and
+  `paymentCode` in the options array. The server resolves a non-id value straight from the paired
+  positional `*Id` argument as well, so the options array is not needed just to carry a code.
+  Two limits worth knowing: `rotationCode` is **not** a code — the server accepts only an integer
+  there and copies it into `rotationId`, which is a number of minutes (`0` = By Link) — and
+  `reference/list` publishes a code only for countries (`alpha3`); periods, mobile operators, MIX
+  packages, resident tariffs and payment systems come back as ids (plus names) only.
 - Injectable transport (`'client' => $guzzleLikeObject`) and `getLastResponseStatus()` for
   `status=error` responses that still carry useful `data` (calc warnings such as an insufficient
   balance).
