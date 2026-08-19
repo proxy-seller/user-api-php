@@ -586,8 +586,8 @@ class Api {
      * @param array $options mixId/mixCode live here — there is no positional argument for them
      * @return array
      */
-    function orderCalcMix($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
-        return $this->orderCalc($this->prepareRegular('mix', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options));
+    function orderCalcMix($mix, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
+        return $this->orderCalc($this->prepareMix('mix', $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options));
     }
 
     /**
@@ -618,7 +618,8 @@ class Api {
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $operatorId ObjectId or operator tag; reference/list publishes only the ObjectId
+     * @param string $operatorId ObjectId or operator tag (case-sensitive) from reference/list/mobile
+     *                           → country[].operators.{dedicated,shared}[].id or .tag
      * @param integer $rotationId rotation in MINUTES (0 = By Link). Not a code — "5m" is rejected
      * @param string $mobileServiceType shared | dedicated, required for mobile
      * @param array $options fields without a positional argument (generateAuth, *Code twins)
@@ -682,8 +683,8 @@ class Api {
      * @param array $options mixId/mixCode live here — there is no positional argument for them
      * @return array
      */
-    function orderMakeMix($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareRegular('mix', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)));
+    function orderMakeMix($mix, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
+        return $this->orderMake($this->withGenerateAuth($this->prepareMix('mix', $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)));
     }
 
     /**
@@ -712,7 +713,8 @@ class Api {
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
-     * @param string $operatorId ObjectId or operator tag; reference/list publishes only the ObjectId
+     * @param string $operatorId ObjectId or operator tag (case-sensitive) from reference/list/mobile
+     *                           → country[].operators.{dedicated,shared}[].id or .tag
      * @param integer $rotationId rotation in MINUTES (0 = By Link). Not a code — "5m" is rejected
      * @param string $mobileServiceType shared | dedicated, required for mobile
      * @param array $options fields without a positional argument (generateAuth, *Code twins)
@@ -965,13 +967,67 @@ class Api {
 
     /////////////////////////////// Prolong ///////////////////////////////
 
-    protected function prepareProlong($ids, $periodId, $coupon, $options = []) {
+    /**
+     * MIX-заказ идентифицируется пакетом, а не страной. Значение уезжает в mixId, потому что
+     * именно там сервер резолвит символьный код: normalizeOrderReferenceCodes ищет пакет по
+     * tag и подменяет его на ObjectId ДО parseMixSelection, а тот умеет только findById.
+     * Если положить код в countryId, он будет искаться среди стран и mix не соберётся.
+     *
+     * @param string $sectionCode mix | mix_isp
+     * @param string $mix package code from reference/list/mix -> quantities[].tag, or its ObjectId
+     * @return array
+     */
+    protected function prepareMix($sectionCode, $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options = []) {
         $request = array_merge(
             $this->paymentFields(),
-            compact('ids', 'periodId', 'coupon')
+            compact('sectionCode', 'periodId', 'quantity', 'authorization', 'coupon', 'customTargetName'),
+            ['mixId' => $mix]
         );
+        return $this->applyOrderOptions($request, $options);
+    }
+
+    /**
+     * Продление адресуется теми же IP, которые вернул proxy/list — никаких id знать не нужно.
+     * Сервер сам находит их через resolveProlongIpsToIds (вызывается и в prolong/calc, и в
+     * prolong/make, без всяких условий), берёт столько строк, сколько адресов прислали, и
+     * первыми — истекающие раньше.
+     *
+     * Разделение простое и однозначное: значение с точкой или двоеточием — это адрес, всё
+     * остальное — ObjectId. Формат адреса зависит от типа: ipv4/isp/mix — "ip",
+     * ipv6 — "host:port", mobile — "ip:portHttp:portSocks" (ровно как в proxy/list).
+     *
+     * @param array|string $ipsOrIds
+     * @return array{ips: array, ids: array}
+     */
+    protected function splitProlongTargets($ipsOrIds) {
+        $ips = [];
+        $ids = [];
+        foreach ((array) $ipsOrIds as $value) {
+            $value = trim((string) $value);
+            if ($value === '') {
+                continue;
+            }
+            if (strpos($value, '.') !== false || strpos($value, ':') !== false) {
+                $ips[] = $value;
+            } else {
+                $ids[] = $value;
+            }
+        }
+        return ['ips' => $ips, 'ids' => $ids];
+    }
+
+    protected function prepareProlong($ids, $periodId, $coupon, $options = []) {
+        $targets = $this->splitProlongTargets($ids);
+        $request = array_merge(
+            $this->paymentFields(),
+            compact('periodId', 'coupon'),
+            $targets['ips'] ? ['ips' => $targets['ips']] : [],
+            $targets['ids'] ? ['ids' => $targets['ids']] : []
+        );
+        // orderSeparator* — внутренняя механика MIX-заказов, клиенту она не нужна; оставлены
+        // только чтобы не ломать тех, кто их уже передаёт.
         $allowed = [
-            'ids', 'orderSeparatorIds', 'orderSeparatorId', 'periodId',
+            'ips', 'ids', 'orderSeparatorIds', 'orderSeparatorId', 'periodId',
             'periodCode', 'coupon', 'paymentId', 'paymentCode'
         ];
         $options = array_intersect_key($this->normalizeOptions($options), array_flip($allowed));
@@ -988,10 +1044,11 @@ class Api {
     /**
      * Calculate the renewal
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix
-     * @param array $ids
-     * @param string $periodId ObjectId or period code (e.g. "1m")
+     * @param array $ips IP addresses exactly as proxy/list returned them — no ids needed:
+     *                   ipv4/isp/mix "1.2.3.4", ipv6 "host:port", mobile "ip:portHttp:portSocks".
+     *                   ObjectIds still work if you happen to have them.
+     * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon
-     * @param array $options orderSeparatorIds, orderSeparatorId, periodCode, paymentCode
      * @return array
      */
     function prolongCalc($type, $ids, $periodId, $coupon = '', $options = []) {
@@ -1001,10 +1058,11 @@ class Api {
     /**
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp
-     * @param array $ids
-     * @param string $periodId ObjectId or period code (e.g. "1m")
+     * @param array $ips IP addresses exactly as proxy/list returned them — no ids needed:
+     *                   ipv4/isp/mix "1.2.3.4", ipv6 "host:port", mobile "ip:portHttp:portSocks".
+     *                   ObjectIds still work if you happen to have them.
+     * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon
-     * @param array $options orderSeparatorIds, orderSeparatorId, periodCode, paymentCode
      * @return array ['orderId' => ObjectId-строка, 'total' => …, 'balance' => …, 'listBaseOrderNumbers' => []]
      * @throws ApiException при нехватке средств — продление НЕ состоялось
      */
