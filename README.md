@@ -81,15 +81,15 @@ no need for a chain of `null`s and an options array just to carry them:
 // referenceList('mobile') returns ['items' => <section>]; without a type it returns a map of sections
 $section  = $api->referenceList('mobile')['items'];
 $operator = $section['country'][0]['operators']['dedicated'][0];
-// $operator = ['tag' => 'ee_unitedkingdom', 'name' => 'EE', 'rotations' => [['id' => 5, 'name' => '5 minutes'], …]]
+// $operator = ['id' => 'ee_unitedkingdom', 'name' => 'EE', 'rotations' => [['id' => 5, 'name' => '5 minutes'], …]]
 
 $mobile = $api->orderCalcMobile(
-    'USA',              // country code (alpha3), from reference/list -> country[].alpha3
-    '1m',               // period code, from reference/list -> period[].code
+    'USA',              // from reference/list -> country[].id
+    '1m',               // from reference/list -> period[].id
     1,                  // quantity
     null,               // authorization — optional
     null,               // coupon — optional
-    $operator['tag'],   // operator code, e.g. 'ee_unitedkingdom' (case-sensitive)
+    $operator['id'],    // operator code, e.g. 'ee_unitedkingdom' (case-sensitive)
     5,                  // rotationId: MINUTES, 0 = By Link. Not a code — '5m' is rejected
     'dedicated'         // shared or dedicated; required for mobile
 );
@@ -98,8 +98,8 @@ $uptime = $api->orderCalcIpv4('USA', '1m', 1, null, null, 'my target', ['uptime'
 
 // MIX is addressed by its package code, which goes first — no options array, no nulls up front
 $package = $api->referenceList('mix')['items']['quantities'][0];
-// $package = ['tag' => 'europe-2-mix_IPv4', 'name' => '…', 'quantities' => [10, 20, …]]
-$mix = $api->orderCalcMix($package['tag'], '1m', 10);
+// $package = ['id' => 'europe-2-mix_IPv4', 'name' => '…', 'quantities' => [10, 20, …]]
+$mix = $api->orderCalcMix($package['id'], '1m', 10);
 ```
 
 The remaining `null`s above are genuine optional values (`authorization`, `coupon`), not placeholders.
@@ -137,17 +137,17 @@ in `rotationId`, which is what `rotationCode` would become anyway.
 
 ### What you can pass, and where to get it
 
-`reference/list` gives you a readable code for every field. Read it, pass the code straight into the
-argument — there is no id to look up:
+Every field in the reference is called `id`, and its value is a readable code — not an ObjectId.
+Read `id`, put it in the matching `*Id` argument. That is the whole rule:
 
 | Argument | Pass this | Read it from |
 | --- | --- | --- |
-| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `reference/list` → `country[].alpha3` |
-| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `reference/list` → `period[].code` |
-| `operatorId` | mobile operator tag — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `tag` |
-| `rotationId` | **minutes as an integer**, `0` = By Link. The one field with no code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
-| `mix` (first argument of `orderCalcMix` / `orderMakeMix`) | mix package code — exact match | `reference/list/mix` → `quantities[].tag`, e.g. `europe-2-mix_IPv4` |
-| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `items.tarifs[].code` |
+| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `reference/list` → `country[].id` |
+| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `reference/list` → `period[].id` |
+| `operatorId` | mobile operator code — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `id` |
+| `rotationId` | **minutes as an integer**, `0` = By Link — the one `id` that is a number, not a code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
+| `mix` (first argument of `orderCalcMix` / `orderMakeMix`) | mix package code — exact match | `reference/list/mix` → `quantities[].id`, e.g. `europe-2-mix_IPv4` |
+| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `items.tarifs[].id` |
 | `paymentId` | payment-system ObjectId — the one unavoidable id | `balance/payments/list` → `items[].id` (see "Paying for orders" above) |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer

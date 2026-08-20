@@ -525,16 +525,18 @@ class Api {
      * Форма ответа: referenceList('mobile') отдаёт ['items' => <объект раздела>], а
      * referenceList() без типа — карту разделов, ['ipv4' => <объект>, 'mobile' => <объект>, ...].
      *
-     * Что реально лежит в объекте раздела:
-     *   country[]     id, name, alpha3 — alpha3 это ЕДИНСТВЕННЫЙ код, который отдаёт справочник
-     *   period[]      id, name — кода периода здесь нет
+     * Всюду идентификатор называется id, а внутри лежит читаемый код, не ObjectId.
+     * Значение id кладётся в одноимённый *Id заказа:
+     *   country[]     id, name — id это alpha3 страны ("USA")
+     *   period[]      id, name — id это код периода ("1m")
      *   mobile        country[].operators.{dedicated,shared}[] → id, name,
-     *                 rotations[{id, name}], где rotations[].id — это МИНУТЫ (0 = "By Link");
-     *                 тега оператора в ответе нет
-     *   mix           quantities[] → id, name, quantities[]; тег пакета виден только как
-     *                 country[].tag того же раздела
-     *   resident      список тарифов → id, name; кода тарифа нет
-     * Кода платёжной системы нет и в balance/payments/list — там только id и name.
+     *                 rotations[{id, name}]. У оператора id — его тег, регистр значим;
+     *                 у rotations id — это МИНУТЫ (0 = "By Link"), единственный id-число
+     *   mix           quantities[] → id, name, quantities[] — id это код пакета, рядом сразу
+     *                 доступные количества, так что mixId берите именно отсюда
+     *   resident      tarifs[] → id, name, personal — id это код тарифа ("1-gb")
+     * Исключение одно — balance/payments/list: там id это настоящий ObjectId, потому что
+     * на один код шлюза приходится несколько систем и код их не различает.
      *
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @return array
@@ -974,7 +976,7 @@ class Api {
      * Если положить код в countryId, он будет искаться среди стран и mix не соберётся.
      *
      * @param string $sectionCode mix | mix_isp
-     * @param string $mix package code from reference/list/mix -> quantities[].tag, or its ObjectId
+     * @param string $mix package code from reference/list/mix -> quantities[].id, or its ObjectId
      * @return array
      */
     protected function prepareMix($sectionCode, $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options = []) {
