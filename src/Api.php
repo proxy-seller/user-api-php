@@ -995,8 +995,13 @@ class Api {
      * первыми — истекающие раньше.
      *
      * Разделение простое и однозначное: значение с точкой или двоеточием — это адрес, всё
-     * остальное — ObjectId. Формат адреса зависит от типа: ipv4/isp/mix — "ip",
-     * ipv6 — "host:port", mobile — "ip:portHttp:portSocks" (ровно как в proxy/list).
+     * остальное — ObjectId. Формат адреса зависит от типа: ipv4/isp/mix/mix_isp — "ip",
+     * ipv6 — "host:port", mobile — "ip:port_http:port_socks" (ровно те поля, что отдаёт
+     * proxy/list).
+     *
+     * У ipv6 поле "ip" из proxy/list уже содержит шлюз вместе с портом ("1.2.3.4:26000"),
+     * а "ip_only" — только шлюз. Передаём "ip" как есть, точно так же, как для
+     * остальных типов: двоеточие внутри само уводит строку в ips.
      *
      * @param array|string $ipsOrIds
      * @return array{ips: array, ids: array}
@@ -1047,7 +1052,9 @@ class Api {
      * Calculate the renewal
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix
      * @param array $ips IP addresses exactly as proxy/list returned them — no ids needed:
-     *                   ipv4/isp/mix "1.2.3.4", ipv6 "host:port", mobile "ip:portHttp:portSocks".
+     *                   ipv4/isp/mix/mix_isp "1.2.3.4", ipv6 "host:port", mobile
+     *                   "ip:port_http:port_socks". For ipv6 the "ip" field already carries the
+     *                   gateway with the port ("1.2.3.4:26000"), "ip_only" the bare gateway.
      *                   ObjectIds still work if you happen to have them.
      * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon
@@ -1061,7 +1068,9 @@ class Api {
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp
      * @param array $ips IP addresses exactly as proxy/list returned them — no ids needed:
-     *                   ipv4/isp/mix "1.2.3.4", ipv6 "host:port", mobile "ip:portHttp:portSocks".
+     *                   ipv4/isp/mix/mix_isp "1.2.3.4", ipv6 "host:port", mobile
+     *                   "ip:port_http:port_socks". For ipv6 the "ip" field already carries the
+     *                   gateway with the port ("1.2.3.4:26000"), "ip_only" the bare gateway.
      *                   ObjectIds still work if you happen to have them.
      * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon

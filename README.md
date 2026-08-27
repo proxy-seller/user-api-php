@@ -119,8 +119,17 @@ $order = $api->prolongMake('ipv4', $ips, '1m');   // deducts money
 echo $order['orderId'];
 ```
 
-The address format follows `proxyList()` exactly: `"1.2.3.4"` for ipv4/isp/mix,
-`"host:port"` for ipv6, `"ip:portHttp:portSocks"` for mobile.
+What to send per type, and which `proxyList()` field it is built from:
+
+| Type | Pass this | Built from |
+| --- | --- | --- |
+| `ipv4`, `isp`, `mix`, `mix_isp` | the plain address, `"1.2.3.4"` | `ip` |
+| `ipv6` | the address, `"host:port"` — e.g. `"1.2.3.4:26000"` | `ip` |
+| `mobile` | `"ip:port_http:port_socks"`, e.g. `"1.2.3.4:50100:50101"` | `ip`, `port_http`, `port_socks` |
+
+For `ipv6` the `ip` field already holds the gateway together with the port
+(`"1.2.3.4:26000"`), while `ip_only` holds the bare gateway — so pass `ip` as it comes, exactly
+like every other type.
 
 `prolongMake()` throws `ApiException` when the balance is short — the renewal did not happen.
 Check the price with `prolongCalc()` first if you want to handle that gracefully.
