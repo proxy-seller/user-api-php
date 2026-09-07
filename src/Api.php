@@ -16,6 +16,10 @@ namespace ProxySeller\Userapi;
  *    "Error api key" (LegacyClientApiErrorResponseAdvice). HTTP 429 не существует. Что именно
  *    случилось, по errors[0] не понять — смотрите весь массив через ApiException::getErrors().
  *  - proxy/download/*, resident/geo и resident/geo/isp отдают ФАЙЛ (attachment), а не конверт.
+ *  - order/make объявляет обязательный заголовок X-Fingerprint. Резидентские и скраперные заказы
+ *    без него не создаются вообще, остальные секции его игнорируют. Значение задаётся один раз
+ *    ('fingerprint' в конфиге либо setFingerprint()) и должно быть СТАБИЛЬНЫМ для установки —
+ *    см. assertFingerprint().
  *
  * @see ApiException
  */
@@ -35,17 +39,28 @@ class Api {
      * отправляем только реально переданные ключи, опущенные сервер берёт из сохранённых
      * настроек (AutoTopupService.saveSettings мержит присланное поверх существующего).
      */
-    const AUTO_TOPUP_FIELDS = ['enabled', 'threshold', 'amount', 'subscriptionId', 'dailyCountCap', 'monthlyAmountCap'];
+    const AUTO_TOPUP_FIELDS = ['enabled', 'threshold', 'amount', 'subscriptionId'];
+
+    /**
+     * Поля, УДАЛЁННЫЕ из AutoTopupSetRequestClientDto 18.08.2026. Сервер их больше не читает:
+     * присланные молча игнорируются, вызов отвечает success и не делает ничего. Коды ошибок 54/55
+     * и ключ minDailyCountCap в customData исчезли вместе с ними и не переиспользуются.
+     * Держим отдельным списком, чтобы отбить с внятным текстом, а не общим "unknown field(s)".
+     */
+    const AUTO_TOPUP_REMOVED_FIELDS = ['dailyCountCap', 'monthlyAmountCap'];
 
     protected $client;
     protected $requestBaseUri;
     protected $paymentId = null;
     protected $paymentCode = null;
     protected $generateAuth = 'N';
+    protected $fingerprint = null;
     protected $lastResponseStatus = null;
 
     /**
      * Key placed in https://proxy-seller.com/personal/api/
+     * Кроме key понимает baseUrl/base_url, client (свой транспорт) и fingerprint (значение
+     * заголовка X-Fingerprint для order/make, см. setFingerprint); остальное уходит в Guzzle.
      * @param array $config
      * @throws \Exception
      */
@@ -58,9 +73,11 @@ class Api {
         $baseUrl = isset($config['baseUrl']) ? $config['baseUrl'] :
                 (isset($config['base_url']) ? $config['base_url'] : static::$URL);
         $injectedClient = isset($config['client']) ? $config['client'] : null;
-        unset($config['key'], $config['baseUrl'], $config['base_url'], $config['client']);
+        $fingerprint = isset($config['fingerprint']) ? $config['fingerprint'] : null;
+        unset($config['key'], $config['baseUrl'], $config['base_url'], $config['client'], $config['fingerprint']);
 
         $this->requestBaseUri = rtrim($baseUrl, '/') . '/' . rawurlencode($key) . '/';
+        $this->setFingerprint($fingerprint);
 
         if ($injectedClient !== null) {
             if (!is_object($injectedClient) || !method_exists($injectedClient, 'request')) {
@@ -94,6 +111,10 @@ class Api {
 
     public function getGenerateAuth() {
         return $this->generateAuth;
+    }
+
+    public function getFingerprint() {
+        return $this->fingerprint;
     }
 
     public function getLastResponseStatus() {
@@ -138,6 +159,24 @@ class Api {
      */
     public function setGenerateAuth($yn): void {
         $this->generateAuth = ($yn == 'Y' ? "Y" : "N");
+    }
+
+    /**
+     * Значение заголовка X-Fingerprint для order/make.
+     *
+     * Форму сервер не проверяет («any opaque string is accepted»), но требует СТАБИЛЬНОСТИ в
+     * пределах установки клиента: заголовок введён ради анти-фрода и affiliate-атрибуции, и
+     * случайная строка на каждый процесс ломает ровно их. Поэтому SDK значение не генерирует —
+     * возьмите что-то долгоживущее (id инсталляции, машинный uuid, хеш конфига) и сохраните.
+     *
+     * Пустая строка равнозначна «не задано»: заголовок с пустым значением сервер всё равно
+     * считает отсутствующим.
+     * @param string $fingerprint
+     * @return void
+     */
+    public function setFingerprint($fingerprint): void {
+        $this->fingerprint = ($fingerprint === null || trim((string) $fingerprint) === '')
+                ? null : trim((string) $fingerprint);
     }
 
     /**
@@ -213,6 +252,30 @@ class Api {
     }
 
     /**
+     * Добавляет заголовок к $options, не трогая уже заданные. Отдельного механизма транспорту не
+     * нужно: и Guzzle, и любой инжектированный клиент с тем же request($method, $uri, $options)
+     * читают заголовки из options['headers'] — нужен был только вход для них.
+     *
+     * Пустое значение не отправляем: заголовок с пустым значением сервер всё равно считает
+     * отсутствующим, а в логах он выглядит как заполненный.
+     *
+     * @param array $options
+     * @param string $name
+     * @param string|null $value
+     * @return array
+     */
+    protected function withHeader($options, $name, $value) {
+        if ($value === null || trim((string) $value) === '') {
+            return $options;
+        }
+        if (!isset($options['headers']) || !is_array($options['headers'])) {
+            $options['headers'] = [];
+        }
+        $options['headers'][$name] = trim((string) $value);
+        return $options;
+    }
+
+    /**
      * Drop null values, used for optional query filters
      * @param array $params
      * @return array
@@ -228,21 +291,32 @@ class Api {
      * plain-text телом, мимо конверта {status,data,errors}
      * (ResidentUserApiService.downloadProxyList). Поэтому проверяем на клиенте.
      *
+     * Проверка на слеши относится ТОЛЬКО к литеральному /proxy/download/resident: общий
+     * /proxy/download/{type} обслуживает ProxyController.downloadProxies, где ext не валидируется
+     * вовсе. Раньше SDK запрещал '/' и '\' на обоих маршрутах, и валидный кастомный шаблон со
+     * слешем ("%ip%:%port%@%login%/%password%") отклонялся локально — запрос не уходил.
+     * Длину и CR/LF режем везде: перенос строки в query-параметре не нужен ни одному маршруту,
+     * а 250 символов — потолок шаблона, а не особенность роутинга.
+     *
      * ext — это либо txt, либо csv, либо свой шаблон строки с плейсхолдерами
      * %ip% %port% %login% %user% %password% %protocol% %rotation_link%.
      * @param string $ext
+     * @param boolean $residentRoute выгрузка идёт через /proxy/download/resident
      * @return string
      * @throws \Exception
      */
-    protected function assertExt($ext) {
+    protected function assertExt($ext, $residentRoute = false) {
         if ($ext === null) {
             return null;
         }
         if (strlen($ext) > 250) {
             throw new \Exception("ext is too long (max 250)");
         }
-        if (preg_match('#[\r\n/\\\\]#', $ext)) {
+        if (preg_match('#[\r\n]#', $ext)) {
             throw new \Exception("ext contains forbidden characters");
+        }
+        if ($residentRoute && preg_match('#[/\\\\]#', $ext)) {
+            throw new \Exception("ext contains forbidden characters ('/' and '\\' are rejected by /proxy/download/resident)");
         }
         return $ext;
     }
@@ -281,17 +355,18 @@ class Api {
      * Тело balance/autotopup/set. Сервер делает PARTIAL UPDATE: saveSettings мержит присланное
      * поверх сохранённого, и «поле не пришло» для него равно «поле = null». Полагаться на это
      * равенство не будем — в JSON кладём ТОЛЬКО реально переданные ключи. Так запрос честно
-     * описывает намерение, и его видно в логах: набор из шести null неотличим от «ничего не
+     * описывает намерение, и его видно в логах: набор из четырёх null неотличим от «ничего не
      * меняем», а сериализованный null на любом поле, где сервер однажды перестанет считать его
      * «не прислали», молча затёр бы настройку.
      *
      * Неизвестные ключи отбиваем: Spring Boot по умолчанию игнорирует лишние поля JSON, то есть
-     * опечатка (daily_count_cap вместо dailyCountCap) на сервере прошла бы как успешный запрос,
-     * который ничего не изменил.
+     * опечатка (thresh0ld вместо threshold) на сервере прошла бы как успешный запрос, который
+     * ничего не изменил. По той же причине отдельно отбиваем dailyCountCap и monthlyAmountCap —
+     * их убрали из контракта 18.08.2026, и молчаливый no-op тут ровно тот же.
      *
-     * Границы значений (минимальная сумма/порог/лимит) НЕ проверяем локально: их владелец —
+     * Границы значений (минимальная сумма/порог) НЕ проверяем локально: их владелец —
      * AutoTopupService.saveSettings, а конкретные допустимые числа приходят в
-     * errors[0].customData (minAmount / minThreshold / minDailyCountCap).
+     * errors[0].customData (minAmount / minThreshold).
      *
      * @param array $settings
      * @return array
@@ -303,6 +378,15 @@ class Api {
         }
         if (!is_array($settings)) {
             throw new \InvalidArgumentException('balance/autotopup/set: settings must be an array');
+        }
+
+        $removed = array_intersect(array_keys($settings), self::AUTO_TOPUP_REMOVED_FIELDS);
+        if ($removed) {
+            throw new \InvalidArgumentException(
+                'balance/autotopup/set: field(s) ' . implode(', ', $removed)
+                . ' were removed from the contract on 2026-08-18 and are ignored by the server'
+                . ' (the call would answer success and change nothing); drop them from the payload'
+            );
         }
 
         $unknown = array_diff(array_keys($settings), self::AUTO_TOPUP_FIELDS);
@@ -334,16 +418,9 @@ class Api {
                 $json[$field] = trim($value);
                 continue;
             }
-            if ($field === 'dailyCountCap') {
-                if (is_bool($value) || !is_numeric($value) || (int) $value != $value) {
-                    throw new \InvalidArgumentException('balance/autotopup/set: dailyCountCap must be an integer');
-                }
-                $json[$field] = (int) $value;
-                continue;
-            }
-            // threshold / amount / monthlyAmountCap — BigDecimal на сервере. Значение отдаём
-            // как передали (int/float/числовая строка): строку Jackson тоже принимает, а
-            // приведение к float на больших суммах теряло бы точность.
+            // threshold / amount — BigDecimal на сервере. Значение отдаём как передали
+            // (int/float/числовая строка): строку Jackson тоже принимает, а приведение к float
+            // на больших суммах теряло бы точность.
             if (is_bool($value) || !is_numeric($value)) {
                 throw new \InvalidArgumentException('balance/autotopup/set: ' . $field . ' must be a number');
             }
@@ -472,8 +549,6 @@ class Api {
      *   amount            number  — сумма одного автопополнения
      *   subscriptionId    string|null — закреплённая в настройках подписка Paddle
      *   paymentMethod     array|null  — ['id','status','paymentMethod','brand','last4','exp']
-     *   dailyCountCap     int     — действующий лимит числа списаний в сутки
-     *   monthlyAmountCap  number  — действующий лимит суммы за 30 дней
      *   failCount         int     — подряд идущие неудачные попытки
      *   lastAttemptAt     string|null
      *   lastEvent         array|null — ['status','amount','at','reason'],
@@ -489,7 +564,7 @@ class Api {
     }
 
     /**
-     * Включить/выключить авто-пополнение или поправить его порог, сумму и лимиты.
+     * Включить/выключить авто-пополнение или поправить его порог и сумму.
      *
      * PARTIAL UPDATE: передавайте только те поля, которые меняете — опущенные сервер берёт из
      * сохранённых настроек. Допустимые ключи (AutoTopupSetRequestClientDto):
@@ -497,21 +572,23 @@ class Api {
      *   threshold        number — баланс, ниже которого срабатывает списание
      *   amount           number — сумма одного автопополнения; должна покрывать threshold
      *   subscriptionId   string — подписка Paddle из paymentMethod.id (или subscriptionId) ответа get
-     *   dailyCountCap    int    — свой лимит числа списаний в сутки
-     *   monthlyAmountCap number — свой лимит суммы за 30 дней
+     *
+     * dailyCountCap и monthlyAmountCap из контракта УБРАНЫ (18.08.2026): сервер их не читает,
+     * присланные игнорирует, и вызов с ними возвращал бы success, ничего не изменив. SDK теперь
+     * отбивает их локально — см. AUTO_TOPUP_REMOVED_FIELDS.
      *
      * Валидация серверная и применяется к РЕЗУЛЬТАТУ мержа, поэтому правка одного поля может
      * упасть из-за уже сохранённого другого. Коды ошибок: 49 фича выключена, 50 порог меньше
      * минимума, 51 сумма меньше минимума, 52 сумма не покрывает порог, 53 нет привязанного
-     * способа оплаты, 54 dailyCountCap меньше минимума, 55 monthlyAmountCap меньше amount,
-     * 56 карта истекла. Граничные значения приходят в errors[0].customData
-     * (minAmount / minThreshold / minDailyCountCap) — см. ApiException::getCustomData().
+     * способа оплаты, 56 карта истекла. Коды 54/55 удалены вместе с полями и не переиспользуются.
+     * Граничные значения приходят в errors[0].customData (minAmount / minThreshold) —
+     * см. ApiException::getCustomData().
      *
      * На успехе отдаёт состояние ПОСЛЕ сохранения, в том же виде, что balanceAutoTopupGet().
      *
      * @param array $settings подмножество полей выше
      * @return array
-     * @throws \InvalidArgumentException при неизвестном поле, неверном типе или пустом наборе
+     * @throws \InvalidArgumentException при удалённом/неизвестном поле, неверном типе или пустом наборе
      */
     function balanceAutoTopupSet($settings = []) {
         return $this->request('POST', 'balance/autotopup/set', ['json' => $this->prepareAutoTopupSettings($settings)]);
@@ -577,9 +654,9 @@ class Api {
 
     /**
      * Calculate the order MIX
-     * @param string $countryId ObjectId, country code, or the MIX package: its ObjectId (with
-     *                          quantity) or "packageObjectId:quantity". A package TAG works only
-     *                          through mixId/mixCode — parseMixSelection looks countryId up by id
+     * @param string $mix the MIX package — its code (tag) from reference/list/mix -> quantities[].id,
+     *                    or its ObjectId. The value goes into mixId, not countryId: that is where
+     *                    the server resolves a tag (see prepareMix)
      * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
@@ -651,10 +728,12 @@ class Api {
      * @param string $coupon
      * @param string $customTargetName required for ipv4 (see assertTargetName)
      * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
+     *                       plus fingerprint — X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeIpv4($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareRegular('ipv4', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareRegular('ipv4', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)), $fingerprint);
     }
 
     /**
@@ -666,27 +745,31 @@ class Api {
      * @param string $coupon
      * @param string $customTargetName required for isp (see assertTargetName)
      * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
+     *                       plus fingerprint — X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeIsp($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareRegular('isp', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareRegular('isp', $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)), $fingerprint);
     }
 
     /**
      * Create an order MIX. Attention! Deducts money from the balance.
-     * @param string $countryId ObjectId, country code, or the MIX package: its ObjectId (with
-     *                          quantity) or "packageObjectId:quantity". A package TAG works only
-     *                          through mixId/mixCode — parseMixSelection looks countryId up by id
+     * @param string $mix the MIX package — its code (tag) from reference/list/mix -> quantities[].id,
+     *                    or its ObjectId. The value goes into mixId, not countryId: that is where
+     *                    the server resolves a tag (see prepareMix)
      * @param string $periodId ObjectId or period code (e.g. "1m")
      * @param integer $quantity
      * @param string $authorization
      * @param string $coupon
      * @param string $customTargetName not needed once the MIX package is resolved (see isMixResolved)
-     * @param array $options mixId/mixCode live here — there is no positional argument for them
+     * @param array $options mixId/mixCode live here — there is no positional argument for them;
+     *                       fingerprint sets X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeMix($mix, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareMix('mix', $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareMix('mix', $mix, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options)), $fingerprint);
     }
 
     /**
@@ -699,10 +782,12 @@ class Api {
      * @param string $customTargetName required for ipv6 (see assertTargetName)
      * @param string $protocol HTTPS | SOCKS5
      * @param array $options fields without a positional argument (uptime, generateAuth, *Code twins)
+     *                       plus fingerprint — X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeIpv6($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $customTargetName = null, $protocol = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareIpv6($countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $protocol, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareIpv6($countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $protocol, $options)), $fingerprint);
     }
 
     /**
@@ -720,21 +805,26 @@ class Api {
      * @param integer $rotationId rotation in MINUTES (0 = By Link). Not a code — "5m" is rejected
      * @param string $mobileServiceType shared | dedicated, required for mobile
      * @param array $options fields without a positional argument (generateAuth, *Code twins)
+     *                       plus fingerprint — X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeMobile($countryId, $periodId, $quantity, $authorization = null, $coupon = null, $operatorId = null, $rotationId = null, $mobileServiceType = 'dedicated', $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareMobile($countryId, $periodId, $quantity, $authorization, $coupon, $operatorId, $rotationId, $mobileServiceType, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareMobile($countryId, $periodId, $quantity, $authorization, $coupon, $operatorId, $rotationId, $mobileServiceType, $options)), $fingerprint);
     }
 
     /**
      * Create an order Resident. Attention! Deducts money from the balance.
+     * ТРЕБУЕТ X-Fingerprint: без него сервер заказ не создаёт (см. assertFingerprint).
      * @param string $tarifId ObjectId or tariff code; reference/list publishes only the ObjectId
      * @param string $coupon
      * @param array $options fields without a positional argument (generateAuth, paymentCode, ...)
+     *                       plus fingerprint — X-Fingerprint just for this call, see setFingerprint()
      * @return array
      */
     function orderMakeResident($tarifId, $coupon = null, $options = []) {
-        return $this->orderMake($this->withGenerateAuth($this->prepareResident($tarifId, $coupon, $options)));
+        $fingerprint = $this->takeFingerprint($options);
+        return $this->orderMake($this->withGenerateAuth($this->prepareResident($tarifId, $coupon, $options)), $fingerprint);
     }
 
     protected function prepareRegular($sectionCode, $countryId, $periodId, $quantity, $authorization, $coupon, $customTargetName, $options = []) {
@@ -793,7 +883,38 @@ class Api {
     }
 
     /**
-     * Мержит options в тело заказа и убирает *Id, если пришёл парный непустой *Code.
+     * Вынимает fingerprint из options: это ЗАГОЛОВОК, а не поле тела, и в JSON ему делать нечего.
+     * Работает по ссылке, чтобы дальше в prepare* уехал уже очищенный набор.
+     *
+     * @param array|boolean|null $options
+     * @return string|null
+     */
+    protected function takeFingerprint(&$options) {
+        if (!is_array($options) || !array_key_exists('fingerprint', $options)) {
+            return null;
+        }
+        $fingerprint = $options['fingerprint'];
+        unset($options['fingerprint']);
+        return $fingerprint;
+    }
+
+    /**
+     * Значение задано? Серверный trimToNull считает незаданными и null, и пустую строку, и строку
+     * из пробелов — иначе `countryCode => ''` стирал бы валидный парный countryId.
+     * Ноль (rotationId = 0, «By Link») пустым НЕ считается.
+     *
+     * @param array $request
+     * @param string $key
+     * @return boolean
+     */
+    protected function isFilled($request, $key) {
+        return array_key_exists($key, $request)
+            && $request[$key] !== null
+            && trim((string) $request[$key]) !== '';
+    }
+
+    /**
+     * Мержит options в тело заказа и разводит пары *Id / *Code по правилам сервера.
      *
      * Как сервер разбирает id и коды (ClientApiService.normalizeOrderReferenceCodes):
      *  - countryId, periodId, operatorId, mixId, tarifId, paymentId принимают ObjectId ЛИБО код:
@@ -807,6 +928,8 @@ class Api {
      *    "Set existed [rotationCode] from reference". Передавайте минуты числом в rotationId.
      *  - Коды резолвятся только на order/calc, order/make, prolong/calc и prolong/make. Остальные
      *    эндпоинты (в том числе balance/add) принимают исключительно id.
+     *  - Если заполнены ОБЕ половины пары, старшинство зависит от пары: у payment/country/period
+     *    старше *Code, у operator/rotation/mix/tarif — *Id. Таблицу повторяем ниже по коду.
      *
      * @param array $request
      * @param array|boolean|null $options
@@ -823,18 +946,24 @@ class Api {
         $options = array_intersect_key($this->normalizeOptions($options), array_flip($allowed));
         $request = array_merge($request, $options);
 
-        $pairs = [
-            'countryCode' => 'countryId',
-            'periodCode' => 'periodId',
-            'paymentCode' => 'paymentId',
-            'mixCode' => 'mixId',
-            'operatorCode' => 'operatorId',
-            'rotationCode' => 'rotationId',
-            'tarifCode' => 'tarifId'
-        ];
-        foreach ($pairs as $code => $id) {
-            if (array_key_exists($code, $options) && $options[$code] !== null) {
+        // Приоритет внутри пары у сервера НЕ единый (normalizeOrderReferenceCodes):
+        //  - payment/country/period: ветка *Code идёт ПЕРВОЙ и перезаписывает *Id;
+        //  - operator/rotation/mix/tarif: ветка кода стоит под `&& !trimToNull(*Id)`, то есть
+        //    старше *Id, а код в этом случае не смотрят вовсе.
+        // SDK снимал *Id для всех семи пар, и по нижним четырём клиент, заполнивший обе половины,
+        // молча получал не тот пакет/оператора/ротацию/тариф, который выбрал бы сервер.
+        $codeWins = ['countryCode' => 'countryId', 'periodCode' => 'periodId', 'paymentCode' => 'paymentId'];
+        $idWins = ['operatorCode' => 'operatorId', 'rotationCode' => 'rotationId',
+            'mixCode' => 'mixId', 'tarifCode' => 'tarifId'];
+
+        foreach ($codeWins as $code => $id) {
+            if ($this->isFilled($request, $code)) {
                 unset($request[$id]);
+            }
+        }
+        foreach ($idWins as $code => $id) {
+            if ($this->isFilled($request, $code) && $this->isFilled($request, $id)) {
+                unset($request[$code]);
             }
         }
 
@@ -869,12 +998,52 @@ class Api {
      *        'listBaseOrderNumbers' => [...], 'balance' => number].
      * orderId нельзя приводить к int — это 24-символьный ObjectId
      * (OrderMakeResponseClientDto.OrderMakeDataClientDto.orderId).
+     *
+     * Единственный эндпоинт, который отправляет X-Fingerprint: заголовок объявлен required именно
+     * на order/make, и когда значение задано, мы шлём его для ЛЮБОЙ секции — прочие секции его
+     * игнорируют, а резидентская и скраперная без него не создаются (см. assertFingerprint).
+     *
      * @param array $json Free format array to send into endpoint
+     * @param string $fingerprint X-Fingerprint только для этого вызова; по умолчанию берётся
+     *                            значение клиента (getFingerprint)
      * @return array
      */
-    function orderMake($json) {
+    function orderMake($json, $fingerprint = null) {
         $this->assertTargetName($json);
-        return $this->request('POST', 'order/make', ['json' => $json]);
+        $fingerprint = ($fingerprint === null || trim((string) $fingerprint) === '')
+                ? $this->getFingerprint() : $fingerprint;
+        $this->assertFingerprint($json, $fingerprint);
+        return $this->request('POST', 'order/make', $this->withHeader(['json' => $json], 'X-Fingerprint', $fingerprint));
+    }
+
+    /**
+     * X-Fingerprint обязателен для резидентских и скраперных заказов: OrderService
+     * (createResidentOrder / createScraperOrder) отвечает "Header X-Fingerprint is required" и
+     * заказ НЕ создаёт. Проверяем локально — тем же приёмом, что assertTargetName: не платить
+     * сетевым запросом за заведомый отказ.
+     *
+     * Значение SDK не генерирует СПЕЦИАЛЬНО. Контракт просит стабильный идентификатор установки,
+     * а случайная строка на процесс ломает ровно то, ради чего заголовок и вводили — анти-фрод и
+     * affiliate-атрибуцию; отказ здесь честнее молчаливо испорченной атрибуции.
+     *
+     * @param array $json
+     * @param string|null $fingerprint
+     * @throws \InvalidArgumentException
+     */
+    protected function assertFingerprint($json, $fingerprint) {
+        if ($fingerprint !== null && trim((string) $fingerprint) !== '') {
+            return;
+        }
+        $section = isset($json['sectionCode']) ? $json['sectionCode'] : null;
+        if (!in_array($section, ['resident', 'scraper'], true)) {
+            return;
+        }
+        throw new \InvalidArgumentException(
+            "X-Fingerprint is required for {$section} orders (client api answers "
+            . '"Header X-Fingerprint is required" and creates nothing). Set a stable per-installation '
+            . "value once — new Api(['key' => ..., 'fingerprint' => ...]) or setFingerprint() — or pass "
+            . "it as ['fingerprint' => ...] in the options array. Do not generate a random one per run."
+        );
     }
 
     /**
@@ -952,7 +1121,12 @@ class Api {
             return $data;
         }
         if ($data === null) {
-            return [];
+            // data = null внутри status="success" означает, что удалять было НЕЧЕГО:
+            // ResidentSubUserController заполняет data только когда deleteSubPackage вернул true,
+            // иначе поле остаётся пустым, а статус всё равно success. Пустой массив здесь
+            // выглядел как удавшееся удаление — отдаём то же not-found, что соседняя ручка
+            // пишет строкой.
+            return ['status' => 'not-found'];
         }
         if (is_string($data)) {
             $trimmed = trim($data);
@@ -1039,10 +1213,13 @@ class Api {
         ];
         $options = array_intersect_key($this->normalizeOptions($options), array_flip($allowed));
         $request = array_merge($request, $options);
-        if (array_key_exists('periodCode', $options) && $options['periodCode'] !== null) {
+        // У обеих пар prolong'а (normalizeProlongReferenceCodes) *Code разбирается ПЕРВЫМ и
+        // перезаписывает *Id, так что снимаем парный id. Пустое значение считаем незаданным —
+        // см. isFilled: иначе periodCode => '' стирал бы валидный periodId.
+        if ($this->isFilled($request, 'periodCode')) {
             unset($request['periodId']);
         }
-        if (array_key_exists('paymentCode', $options) && $options['paymentCode'] !== null) {
+        if ($this->isFilled($request, 'paymentCode')) {
             unset($request['paymentId']);
         }
         return $this->filterNull($request);
@@ -1075,46 +1252,201 @@ class Api {
      * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon
      * @return array ['orderId' => ObjectId-строка, 'total' => …, 'balance' => …, 'listBaseOrderNumbers' => []]
-     * @throws ApiException при нехватке средств — продление НЕ состоялось
+     * @throws ApiException при нехватке средств — продление НЕ состоялось; данные расчёта
+     *                      (warning/total/balance) остаются в ApiException::getData()
      */
     function prolongMake($type, $ids, $periodId, $coupon = '', $options = []) {
-        return $this->assertProlongMade(
-            $this->request('POST', 'prolong/make/' . rawurlencode($type), ['json' => $this->prepareProlong($ids, $periodId, $coupon, $options)])
-        );
+        // Своего гарда здесь больше нет. ProlongMakeResponseClientDto::ofInsufficientFunds теперь
+        // кладёт причину в errors[{code:16, "Insufficient funds on balance"}], а не оставляет
+        // errors[] пустым, — значит нехватку средств отбивает общая ветка разбора конверта, и
+        // calc-данные приезжают в ApiException::getData(). Прежняя проверка «нет orderId — значит
+        // провал» под новую форму уже не срабатывала, а единственным её оставшимся эффектом было
+        // превращать ЛЕГИТИМНЫЙ status="success" с пустым orderId в фальшивую ошибку — теряя
+        // total/balance/listBaseOrderNumbers уже ПОСЛЕ списания денег.
+        return $this->request('POST', 'prolong/make/' . rawurlencode($type), ['json' => $this->prepareProlong($ids, $periodId, $coupon, $options)]);
+    }
+
+    /////////////////////////////// Autoprolong ///////////////////////////////
+
+    /**
+     * Тело autoprolong/* — это ProlongRequest плюс subscriptionId и tarifId
+     * (AutoProlongRequestClientDto наследует ProlongRequestClientDto специально). Поэтому собираем
+     * его тем же prepareProlong: адресация прокси у ручного и авто-продления общая, и сервер
+     * разбирает оба тела одним normalizeProlongReferenceCodes.
+     *
+     * Купона тут нет СОЗНАТЕЛЬНО, хотя поле унаследовано и в prolong/calc работает: автопродление
+     * промокод не применяет нигде (autoProlongCalc не передаёт его в расчёт, в домене Autoextend
+     * его негде хранить), и превью со скидкой врало бы ровно про ту сумму, ради которой ручку и
+     * зовут.
+     *
+     * Алиасы payment_id / subscription_id / tarif_id / tariffId сервер принимает, но приоритет у
+     * camelCase — каноническое написание и шлём.
+     *
+     * @param string $type
+     * @param array|string $ids
+     * @param string $periodId
+     * @param array|null $options subscriptionId, tarifId плюс всё, что понимает prepareProlong
+     * @return array
+     */
+    protected function prepareAutoProlong($type, $ids, $periodId, $options = []) {
+        $options = $this->normalizeOptions($options);
+        $extra = array_intersect_key($options, array_flip(['subscriptionId', 'tarifId']));
+        $request = array_merge($this->prepareProlong($ids, $periodId, null, $options), $extra);
+
+        if ($this->isResidentAutoProlong($type)) {
+            // Резидентка автопродлевается ПАКЕТОМ: адресов и периода у неё нет. Роутер собирает
+            // из тела только платёжку и тариф (ClientApiAutoProlongRouter -> AutoRenewCalculate/
+            // EnableRequestDto), остальное не читается — не отправляем, чтобы запрос не обещал
+            // выборку, которой не будет.
+            unset($request['ids'], $request['ips'], $request['orderSeparatorIds'],
+                  $request['orderSeparatorId'], $request['periodId'], $request['periodCode']);
+        }
+        return $this->filterNull($request);
     }
 
     /**
-     * При нехватке средств prolong/make отдаёт конверт status="error" с ПУСТЫМ errors[] и
-     * calc-данными в data (ProlongMakeResponseClientDto::ofInsufficientFunds,
-     * ClientApiService.groovy:3185) — то есть ровно ту же форму, что легитимный warning у
-     * prolong/calc. Из-за этого общая ветка разбора конверта возвращала данные как успех, и
-     * несостоявшееся продление выглядело как состоявшееся. Признак провала — отсутствие
-     * orderId (на успехе это ProlongMakeDataClientDto с непустым orderId).
-     *
-     * order/make этой проблемы не имеет: у OrderMakeResponseClientDto есть только
-     * ofSuccess/ofError, и при ошибке errors[] всегда заполнен.
-     *
-     * @param mixed $data
-     * @return array
-     * @throws ApiException
+     * Написания типа, которые роутер отправляет в резидентскую ветку (RESIDENT_TYPES).
+     * @param string $type
+     * @return boolean
      */
-    protected function assertProlongMade($data) {
-        if (!is_array($data)) {
-            return $data;
+    protected function isResidentAutoProlong($type) {
+        return in_array(strtolower(trim((string) $type)), ['resident', 'residential'], true);
+    }
+
+    /**
+     * scraper автопродления не имеет: трафик к нему докупают заказом, и сервер отвечает
+     * "Create new order to add traffic, prolong options not available" (prepareAutoProlong,
+     * ветка isTariffBasedSection). Отбиваем локально, как assertReplaceType.
+     *
+     * @param string $type
+     * @throws \InvalidArgumentException
+     */
+    protected function assertAutoProlongType($type) {
+        if (strtolower(trim((string) $type)) === 'scraper') {
+            throw new \InvalidArgumentException(
+                'autoprolong: scraper is not supported (client api answers "Create new order to add '
+                . 'traffic, prolong options not available") — buy traffic with orderMake() instead'
+            );
         }
-        $orderId = isset($data['orderId']) ? trim((string) $data['orderId']) : '';
-        if ($orderId !== '') {
-            return $data;
+    }
+
+    /**
+     * paymentId обязателен для calc и enable, в отличие от prolong/*: списание произойдёт БЕЗ
+     * клиента, и «по умолчанию с баланса» было бы догадкой за него — сервер отвечает
+     * "Set [paymentId]" (resolveAutoProlongPaymentSystem). Проверяем локально, раз остальные
+     * обязательные поля SDK уже проверяет.
+     *
+     * Допустимы только balance и paddle_subscription: разовый чекаут Paddle требует редиректа в
+     * браузер, которого у headless-клиента нет. Сам список не проверяем — за ObjectId-ом платёжки
+     * её тип отсюда не виден, это сделает сервер ("Set [paymentId] from: balance / paddle_subscription").
+     *
+     * subscriptionId спрашиваем только когда платёжка названа буквально paddle_subscription; в
+     * остальных случаях требование проверит сервер ("Set [subscriptionId]").
+     *
+     * @param array $json
+     * @throws \InvalidArgumentException
+     */
+    protected function assertAutoProlongPayment($json) {
+        $payment = null;
+        foreach (['paymentId', 'paymentCode'] as $key) {
+            if ($this->isFilled($json, $key)) {
+                $payment = trim((string) $json[$key]);
+                break;
+            }
         }
-        $warning = isset($data['warning']) ? trim((string) $data['warning']) : '';
-        throw new ApiException(
-            $warning !== '' ? $warning : 'prolong/make did not create an order (insufficient funds)',
-            0,
-            200,
-            [],
-            $data,
-            ''
-        );
+        if ($payment === null) {
+            throw new \InvalidArgumentException(
+                'autoprolong: paymentId is required for calc/enable (client api answers "Set [paymentId]"), '
+                . 'only balance and paddle_subscription are accepted. Set it once via setPaymentId()/'
+                . 'setPaymentCode(), or pass paymentId/paymentCode in the options array.'
+            );
+        }
+        if ($payment === 'paddle_subscription' && !$this->isFilled($json, 'subscriptionId')) {
+            throw new \InvalidArgumentException(
+                'autoprolong: subscriptionId is required when paying with paddle_subscription '
+                . '(client api answers "Set [subscriptionId]")'
+            );
+        }
+    }
+
+    /**
+     * Сколько спишется за автопродление и КОГДА. Ничего не меняет.
+     *
+     * data: warning, balance, total, quantity, currency, discount, orders, items[], days,
+     * dateEnd, chargeDate, paymentId (канонический КОД платёжки, не ObjectId), autoProlong;
+     * у резидентки дополнительно tarifId. Даты — строки "yyyy-MM-dd HH:mm:ss".
+     *
+     * chargeDate — это НЕ дата окончания: сервер держит два механизма автопродления, один списывает
+     * за сутки до, другой в день окончания, и значение считается по действующему. У type=resident
+     * оно всегда null (пакет продлевается по дате ИЛИ по исчерпанию трафика), там смотрите dateEnd;
+     * days у резидентки — период её собственного тарифа.
+     *
+     * Нехватка баланса — НЕ исключение: приходит status="error" с ЗАПОЛНЕННЫМ data и ПУСТЫМ
+     * errors[], та же форма, что у prolong/calc, и SDK отдаёт данные как обычно.
+     * Проверить статус можно через getLastResponseStatus().
+     *
+     * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param array $ids IP addresses as proxy/list returned them, ровно как в prolongCalc;
+     *                   для resident не нужны — единица правки там пакет
+     * @param string $periodId period code from reference/list, e.g. "1m"; для resident не нужен
+     * @param array $options subscriptionId, tarifId, paymentId/paymentCode, orderSeparatorIds
+     * @return array
+     * @throws \InvalidArgumentException при type=scraper и без платёжки
+     */
+    function autoProlongCalc($type, $ids = [], $periodId = null, $options = []) {
+        $this->assertAutoProlongType($type);
+        $json = $this->prepareAutoProlong($type, $ids, $periodId, $options);
+        $this->assertAutoProlongPayment($json);
+        return $this->request('POST', 'autoprolong/calc/' . rawurlencode($type), ['json' => $json]);
+    }
+
+    /**
+     * Включить автопродление. Сейчас НИЧЕГО не списывает, только вооружает будущее списание.
+     *
+     * data: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
+     * quantity/ids — это РЕАЛЬНО затронутые прокси, а не эхо запроса: ipv6 включается целым
+     * заказом, поэтому один адрес включает все. У type=resident приходит quantity=1 и пустой ids —
+     * единица правки там пакет; тело тогда пакетное (paymentId, необязательно tarifId).
+     *
+     * Заменяет удалённый resident/autorenew/enable.
+     *
+     * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param array $ids IP addresses as proxy/list returned them; для resident не нужны
+     * @param string $periodId period code from reference/list, e.g. "1m"; для resident не нужен
+     * @param array $options subscriptionId, tarifId, paymentId/paymentCode, orderSeparatorIds
+     * @return array
+     * @throws \InvalidArgumentException при type=scraper и без платёжки
+     */
+    function autoProlongEnable($type, $ids = [], $periodId = null, $options = []) {
+        $this->assertAutoProlongType($type);
+        $json = $this->prepareAutoProlong($type, $ids, $periodId, $options);
+        $this->assertAutoProlongPayment($json);
+        return $this->request('POST', 'autoprolong/enable/' . rawurlencode($type), ['json' => $json]);
+    }
+
+    /**
+     * Выключить автопродление и сбросить привязанные период с платёжкой — следующий enable
+     * придётся звать с ними снова. Прокси никуда не деваются, просто перестают продлеваться сами.
+     *
+     * data: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd, где
+     * days/paymentId/chargeDate всегда null, а dateEnd показывает, до какого числа всё ещё оплачено.
+     * Ни период, ни платёжка здесь не нужны. У type=resident не нужна и выборка: выключение
+     * адресуется пакетом вызывающего аккаунта.
+     *
+     * Заменяет удалённый resident/autorenew/disable.
+     *
+     * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param array $ids IP addresses as proxy/list returned them; для resident не нужны
+     * @param array $options orderSeparatorIds и прочее, что понимает prepareProlong
+     * @return array
+     * @throws \InvalidArgumentException при type=scraper
+     */
+    function autoProlongDisable($type, $ids = [], $options = []) {
+        $this->assertAutoProlongType($type);
+        $json = $this->prepareAutoProlong($type, $ids, null, $options);
+        // См. residentConsumption: пустой PHP-массив json_encode превращает в [], а Spring ждёт
+        // объект и отвечает голым HTTP 400 мимо конверта. Для resident тело как раз пустое.
+        return $this->request('POST', 'autoprolong/disable/' . rawurlencode($type), ['json' => $json ? $json : new \stdClass()]);
     }
 
     /////////////////////////////// Proxy ///////////////////////////////
@@ -1155,7 +1487,12 @@ class Api {
             throw new \InvalidArgumentException('filters must be an array');
         }
 
-        if (strtolower(trim((string) $type)) === 'resident'
+        // $type = resident уводит запрос на ЛИТЕРАЛЬНЫЙ /proxy/download/resident (Spring отдаёт
+        // точное совпадение пути раньше {type}), а там ext валидирует ResidentUserApiService —
+        // см. assertExt. На остальных типах слеши в шаблоне законны.
+        $residentRoute = strtolower(trim((string) $type)) === 'resident';
+
+        if ($residentRoute
             && isset($filters['package_key'])
             && trim((string) $filters['package_key']) !== '') {
             // Иначе тихо выгружался бы РОДИТЕЛЬСКИЙ пакет: сервер параметр игнорирует и
@@ -1174,7 +1511,7 @@ class Api {
         unset($filters['ext']);
 
         $query = $this->filterNull(array_merge(compact('proto', 'listId'), $filters));
-        $validatedExt = $this->assertExt($ext);
+        $validatedExt = $this->assertExt($ext, $residentRoute);
         if ($validatedExt !== null) {
             $query['ext'] = $validatedExt;
         }
@@ -1185,12 +1522,13 @@ class Api {
      * Export the resident proxy list. Возвращает ФАЙЛ (attachment), не конверт JSON.
      * @param string|integer $id list id — числовой id листа (резидентские листы, в отличие от
      *                           остальных сущностей v2, живут под Long-идентификаторами)
-     * @param string $ext - txt | csv | свой шаблон с плейсхолдерами
+     * @param string $ext - txt | csv | свой шаблон с плейсхолдерами. Слеши здесь запрещены
+     *                      сервером (см. assertExt), в отличие от общего /proxy/download/{type}
      * @param integer $maxLine
      * @return string|\Psr\Http\Message\StreamInterface
      */
     function proxyDownloadResident($id = null, $ext = null, $maxLine = null, $returnStream = false) {
-        $ext = $this->assertExt($ext);
+        $ext = $this->assertExt($ext, true);
         return $this->requestRaw('GET', 'proxy/download/resident', ['query' => $this->filterNull(compact('id', 'ext', 'maxLine'))], $returnStream);
     }
 

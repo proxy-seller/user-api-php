@@ -2,3 +2,5 @@ vendor/
 nbproject/
 debug.php
 /composer.lock
+.phpunit.result.cache
+.phpunit.cache/

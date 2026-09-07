@@ -7,7 +7,16 @@ Breaking changes against 1.x are listed in [CHANGELOG.md](CHANGELOG.md).
 ## Install
 
 ```sh
-composer require proxy-seller/user-api-php
+composer require proxy-seller/user-api-php:^2.0
+```
+
+**Pin the major.** 1.x is the client for `/personal/api/v1/` and is a different API, so a bare
+`composer require proxy-seller/user-api-php` can resolve to 1.x and none of this document applies.
+2.0.0 is not tagged yet (see [CHANGELOG.md](CHANGELOG.md)); until it is, install this branch
+directly:
+
+```sh
+composer require proxy-seller/user-api-php:dev-feature/client-api-v2
 ```
 
 ## Configuration
@@ -22,6 +31,7 @@ use ProxySeller\Userapi\ApiException;
 
 $api = new Api([
     'key' => 'YOUR_API_KEY',
+    'fingerprint' => 'my-installation-id',   // required for resident/scraper orders, see below
     'timeout' => 15,
     'connect_timeout' => 5,
 ]);
@@ -104,6 +114,22 @@ $mix = $api->orderCalcMix($package['id'], '1m', 10);
 
 The remaining `null`s above are genuine optional values (`authorization`, `coupon`), not placeholders.
 
+### Residential and scraper orders need a fingerprint
+
+`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and scraper orders are not created without it at all** — the order service answers `Header X-Fingerprint is required` and nothing is ordered.
+
+```php
+$api = new Api(['key' => 'YOUR_API_KEY', 'fingerprint' => 'my-installation-id']);
+// or later:
+$api->setFingerprint('my-installation-id');
+// or for a single call:
+$api->orderMakeResident('tarif-code', null, ['fingerprint' => 'my-installation-id']);
+```
+
+Any opaque string is accepted — the server does not validate its shape — but it must be a **stable identifier of your installation**. The SDK deliberately does not generate one: a value randomized per process would break the anti-fraud and affiliate attribution the header exists for.
+
+Ordering resident or scraper without a fingerprint raises `\InvalidArgumentException` locally, rather than spending a round trip on a request the server is certain to reject.
+
 ## Renewing proxies
 
 You renew by the same IP addresses `proxyList()` gave you. No ids, no separators:
@@ -169,6 +195,36 @@ needs one only when the server cannot tell which package you mean, so naming the
 need for it.
 
 For a fully custom payload use `orderCalc(array $payload)` or `orderMake(array $payload)`.
+
+## Automatic renewal
+
+`prolongMake()` charges you now. `autoprolong/*` only arms a charge that happens later, without you present — a separate branch of the API, not a flag on prolong.
+
+```php
+$api->autoProlongCalc('ipv4', ['1.2.3.4'], '1m', ['paymentId' => 'balance']);
+$api->autoProlongEnable('ipv4', ['1.2.3.4'], '1m', ['paymentId' => 'balance']);
+$api->autoProlongDisable('ipv4', ['1.2.3.4']);
+```
+
+`paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a one-off Paddle checkout needs a browser redirect a headless client cannot complete. With `paddle_subscription` also pass `subscriptionId`.
+
+Residential packages renew as a package, not as addresses — send no selection:
+
+```php
+$api->autoProlongCalc('resident', [], null, ['paymentId' => 'balance']);
+$api->autoProlongEnable('resident', [], null, ['paymentId' => 'balance', 'tarifId' => 'trial']);
+$api->autoProlongDisable('resident');
+```
+
+Three things about the answers before you parse them:
+
+* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and `ids` can cover more proxies than you sent.
+* **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled* `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
+* **Residential fills different fields.** `days` and `chargeDate` are null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead.
+
+`scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
+
+> Replaces `resident/autorenew/{enable,disable,calculate}`, **removed** from the server.
 
 ## Errors
 
@@ -248,7 +304,7 @@ Auto top-up charges a saved Paddle payment method when the balance drops below `
 ```php
 $state = $api->balanceAutoTopupGet();
 // configured, enabled, state (NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID | PAUSED_FAILURES),
-// threshold, amount, subscriptionId, paymentMethod, dailyCountCap, monthlyAmountCap,
+// threshold, amount, subscriptionId, paymentMethod,
 // failCount, lastAttemptAt, lastEvent
 
 // Partial update: only the fields you pass are sent, everything else keeps its stored value.
@@ -256,9 +312,11 @@ $after = $api->balanceAutoTopupSet(['threshold' => 10]);
 $after = $api->balanceAutoTopupSet(['enabled' => false]);
 ```
 
-Allowed keys are `enabled`, `threshold`, `amount`, `subscriptionId`, `dailyCountCap`, `monthlyAmountCap`. Anything else raises `\InvalidArgumentException` locally — the server ignores unknown JSON fields, so a typo such as `daily_count_cap` would otherwise look like a successful call that changed nothing. `set` returns the state *after* saving, so no second `get` is needed.
+Allowed keys are `enabled`, `threshold`, `amount`, `subscriptionId`. Anything else raises `\InvalidArgumentException` locally — the server ignores unknown JSON fields, so a typo such as `daily_count_cap` would otherwise look like a successful call that changed nothing. `set` returns the state *after* saving, so no second `get` is needed.
 
-Validation runs server-side on the **merged** result, which means changing one field can fail because of another one that was already stored. Error codes: `49` feature unavailable, `50` threshold below minimum, `51` amount below minimum, `52` amount does not cover the threshold, `53` no saved payment method, `54` `dailyCountCap` below minimum, `55` `monthlyAmountCap` below a single top-up amount, `56` saved card expired. Bounds come back in `customData` (`minAmount`, `minThreshold`, `minDailyCountCap`).
+> **`dailyCountCap` and `monthlyAmountCap` are gone.** Removed from the contract on 2026-08-18: the server silently ignores them and they are absent from the response. The SDK now rejects them by name for exactly the reason above — otherwise `balanceAutoTopupSet(['dailyCountCap' => 3])` would report success and change nothing.
+
+Validation runs server-side on the **merged** result, which means changing one field can fail because of another one that was already stored. Error codes: `49` feature unavailable, `50` threshold below minimum, `51` amount below minimum, `52` amount does not cover the threshold, `53` no saved payment method, `56` saved card expired. Codes `54` and `55` were removed together with the caps and are not reused. Bounds come back in `customData` (`minAmount`, `minThreshold`).
 
 ## Proxy replacement
 
@@ -288,10 +346,24 @@ Valid reasons: `NOT_WORK`, `INCORRECT_LOCATION`, `CANT_CHANGE_NETWORK`, `LOW_SPE
 
 ## Local verification
 
-```powershell
+```bash
 composer install
-Get-ChildItem -Recurse -Filter *.php | ForEach-Object { php -l $_.FullName }
-composer dump-autoload
+composer test          # or: vendor/bin/phpunit
 ```
+
+The suite is **offline**: `Api` accepts an injected HTTP client through the `client` config key, so the tests drive the SDK with canned envelopes and inspect the request it built. They answer "does the SDK assemble and parse correctly", not "is the server up" — nothing is mocked away that the SDK itself is responsible for.
+
+Every assertion mirrors the behaviour of `client-api-service`, not of this README: docs can drift from the server without anyone noticing, a test cannot. What is covered:
+
+- the api key as a **path segment** (v2 puts it in the URL, not a header) and URL-encoding of it;
+- the envelope — business errors arrive with **HTTP 200**, so the status code proves nothing; the deliberately uninformative three-error access triple must stay fully visible;
+- local gates that save a round trip on a certain refusal: `customTargetName` for ipv4/ipv6/isp, `balanceAdd` with only a `paymentCode`, `X-Fingerprint` for residential and scraper orders;
+- the **split precedence** of `*Id` / `*Code` — the code wins for country/period/payment, the *id* wins for mix/operator/rotation/tarif — and the fact that the raw `orderCalc(array)` form leaves a caller-built body untouched;
+- `generateAuth` reaching `order/make` only, since `order/calc` silently drops it;
+- auto top-up: the caps removed from the contract on 2026-08-18 are rejected **by name**, partial updates send only what was passed, and `false` / `0` are not mistaken for "unset";
+- download routing — a custom `ext` with a slash is legal on `/proxy/download/{type}` but not on the literal `/proxy/download/resident`, which also ignores `package_key`;
+- `data: null` inside a `status: "success"` delete being reported as `not-found` rather than as a successful deletion;
+- renewal by the addresses `proxyList()` returns, routed into `ips` / `ids` by shape;
+- auto-renewal: `scraper` refused locally, `paymentId` required for calc and enable but not for disable, and the package-shaped residential body.
 
 To exercise a local `client-api-service`, run it on port 7995, configure the local `baseUrl` shown above, use a development API key and call read-only endpoints first (`balance`, `authList`, `residentList`).

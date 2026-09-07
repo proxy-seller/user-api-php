@@ -2,6 +2,50 @@
 
 All notable changes to this package. This project follows [Semantic Versioning](https://semver.org/).
 
+## 2.0.1 — unreleased
+
+Catching up with server changes made after 2.0.
+
+### Added
+
+- **`autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()`** for
+  `autoprolong/{calc,enable,disable}/{type}`. `paymentId` is mandatory on calc and enable and is
+  restricted to `balance` / `paddle_subscription`; `type = 'resident'` sends the package-shaped
+  body (`paymentId`, optional `tarifId`) and takes no address selection.
+- **`X-Fingerprint` on `order/make`.** Configure it as `['fingerprint' => ...]`, with
+  `setFingerprint()`, or per call via `$options['fingerprint']`. Residential and scraper orders
+  now fail locally with `\InvalidArgumentException` when it is unset, instead of being rejected by
+  the server.
+- **`maxLine`** on `proxy/download/resident` — the only route that accepts it.
+
+### Removed
+
+- **`resident/autorenew/{enable,disable,calculate}`** — deleted on the server, replaced by
+  `autoprolong/*` with `type = 'resident'`.
+- **`dailyCountCap` / `monthlyAmountCap`** from `balanceAutoTopupSet()`. Removed from the contract
+  on 2026-08-18 and silently ignored by the server, so passing them made a call that reported
+  success and changed nothing. They are now rejected by name. Error codes `54` and `55` are gone
+  with them, and `customData` no longer carries `minDailyCountCap`.
+
+### Tests
+
+- **A test suite, for the first time.** PHPUnit as a dev dependency, `composer test`,
+  31 offline tests. `Api` already accepted an injected HTTP client through the `client`
+  config key, so no production code had to change to make it testable.
+  Coverage matches the guard suites the other four SDKs carry: the api key as a path
+  segment, the `200`-with-an-error envelope and the access triple, every local gate
+  (`customTargetName`, `balanceAdd`, `X-Fingerprint`), the split `*Id` / `*Code`
+  precedence, `generateAuth` on `order/make` only, the removed auto top-up caps,
+  download routing, `not-found` deletes, address-vs-id renewal routing and auto-renewal.
+
+### Fixed
+
+- **`*Code` no longer overrides a paired `*Id`** for `mixId`, `operatorId`, `rotationId` and
+  `tarifId`. The server applies the code on those four only while the id is empty
+  (`ClientApiService::normalizeOrderReferenceCodes`), so a caller who filled both halves silently
+  got the wrong package, operator, rotation or tariff. `countryCode`, `periodCode` and
+  `paymentCode` keep priority — there the server does prefer the code.
+
 ## 2.0.0 — unreleased
 
 Client API **v2** (`https://proxy-seller.com/personal/api/v2/`) is a different API from v1, not a
@@ -55,11 +99,13 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
 - `balanceAutoTopupGet()` — auto top-up configuration and state (`configured`, `enabled`, `state`,
   `threshold`, `amount`, `subscriptionId`, `paymentMethod`, `dailyCountCap`, `monthlyAmountCap`,
   `failCount`, `lastAttemptAt`, `lastEvent`).
+  *(`dailyCountCap` / `monthlyAmountCap` were dropped again in 2.0.1 — see above.)*
 - `balanceAutoTopupSet(array $settings)` — **partial update**: only the keys you pass are sent, the
   rest keep their stored values. Allowed keys: `enabled`, `threshold`, `amount`, `subscriptionId`,
   `dailyCountCap`, `monthlyAmountCap`. Unknown keys, wrong types and an empty payload raise
   `\InvalidArgumentException` (the server ignores unknown JSON fields, so a typo would otherwise be
   a silent no-op).
+  *(The two cap keys are rejected as of 2.0.1 — see above.)*
 - `ApiException::getFirstError()`, `getMessages()`, `getApiCodes()`, `hasApiCode()`,
   `getCustomData()`, `isAccessError()`. `getCustomData()` exposes the validation bounds the server
   puts in `errors[0].customData` (`minAmount`, `minThreshold`, `minDailyCountCap` for auto top-up).
