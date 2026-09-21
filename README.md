@@ -114,6 +114,31 @@ $mix = $api->orderCalcMix($package['id'], '1m', 10);
 
 The remaining `null`s above are genuine optional values (`authorization`, `coupon`), not placeholders.
 
+### Listing orders
+
+```php
+$orders = $api->orderList([
+    'status'  => 'PAYED',       // PAYED | NOT_PAYED | RETURN — the status_type of the response
+    'sort_by' => 'date_insert', // date_insert | summ | status
+    'order'   => 'desc',
+    'page'    => 1,
+    'limit'   => 20,
+]);
+
+$all = $api->orderList(); // the same call with no filters at all
+```
+
+Every filter is optional and every name is the snake_case one of v1: `order_id`, `start_date`,
+`end_date`, `status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`. The same
+endpoint answers legacy-API clients through the reverse mirror, so the spelling is theirs.
+
+`data` is not a flat list but a `metadata` + `items` pair, and `metadata` is always present:
+without `limit` it reports `total_pages => 1`, `current_limit => 0` and the whole list in `items`.
+`summ` and `items[]['price']` are **strings with the currency already in them** (`'$25.00'`),
+`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`)
+strings. `id` is the legacy bitrix number as a string; our ObjectId is `order_id` — the same value
+`proxyList()` returns as `order_id`.
+
 ### Residential and scraper orders need a fingerprint
 
 `order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and scraper orders are not created without it at all** — the order service answers `Header X-Fingerprint is required` and nothing is ordered.

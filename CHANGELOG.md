@@ -8,6 +8,11 @@ Catching up with server changes made after 2.0.
 
 ### Added
 
+- **`orderList()`** for `GET order/list`. Every filter is optional and keeps the snake_case names
+  of v1 (`order_id`, `start_date`, `end_date`, `status`, `is_extend`, `auto_order`, `page`,
+  `limit`, `sort_by`, `order`), because legacy-API clients reach the same endpoint through the
+  reverse mirror. `data` is a `metadata` + `items` pair rather than a flat list, and `summ` /
+  `items[]['price']` are currency strings (`'$25.00'`), not numbers.
 - **`autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()`** for
   `autoprolong/{calc,enable,disable}/{type}`. `paymentId` is mandatory on calc and enable and is
   restricted to `balance` / `paddle_subscription`; `type = 'resident'` sends the package-shaped
@@ -30,13 +35,14 @@ Catching up with server changes made after 2.0.
 ### Tests
 
 - **A test suite, for the first time.** PHPUnit as a dev dependency, `composer test`,
-  31 offline tests. `Api` already accepted an injected HTTP client through the `client`
+  33 offline tests. `Api` already accepted an injected HTTP client through the `client`
   config key, so no production code had to change to make it testable.
   Coverage matches the guard suites the other four SDKs carry: the api key as a path
   segment, the `200`-with-an-error envelope and the access triple, every local gate
   (`customTargetName`, `balanceAdd`, `X-Fingerprint`), the split `*Id` / `*Code`
   precedence, `generateAuth` on `order/make` only, the removed auto top-up caps,
-  download routing, `not-found` deletes, address-vs-id renewal routing and auto-renewal.
+  download routing, `not-found` deletes, address-vs-id renewal routing, auto-renewal and the
+  v1 filter names of `order/list`.
 
 ### Fixed
 

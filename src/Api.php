@@ -1017,6 +1017,29 @@ class Api {
     }
 
     /**
+     * List of orders.
+     *
+     * data приходит не плоским списком, а парой metadata + items — форма v1, потому что ту же
+     * выдачу через обратное зеркало получают клиенты легаси-API. metadata есть всегда: без
+     * limit там total_pages = 1, current_limit = 0, а весь список лежит в items.
+     *
+     * id, order_id, order_number, base_order_number и items[]['order_part_id'] — СТРОКИ; id —
+     * легаси-число битрикса либо суррогат от base_order_number, наш ObjectId лежит в order_id
+     * (тот же, что order_id в proxyList). summ и items[]['price'] — тоже строки, уже с валютой
+     * ('$25.00'), auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00').
+     *
+     * @param array $filters order_id | start_date | end_date | status | is_extend | auto_order |
+     *                       page | limit | sort_by | order. Имена snake_case, как в v1:
+     *                       status — PAYED | NOT_PAYED | RETURN (это status_type ответа),
+     *                       is_extend и auto_order — 'Y'/'N', sort_by — date_insert | summ | status,
+     *                       order — asc | desc
+     * @return array
+     */
+    function orderList($filters = []) {
+        return $this->request('GET', 'order/list', ['query' => $this->filterNull($filters)]);
+    }
+
+    /**
      * X-Fingerprint обязателен для резидентских и скраперных заказов: OrderService
      * (createResidentOrder / createScraperOrder) отвечает "Header X-Fingerprint is required" и
      * заказ НЕ создаёт. Проверяем локально — тем же приёмом, что assertTargetName: не платить
