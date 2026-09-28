@@ -31,7 +31,7 @@ use ProxySeller\Userapi\ApiException;
 
 $api = new Api([
     'key' => 'YOUR_API_KEY',
-    'fingerprint' => 'my-installation-id',   // required for resident/scraper orders, see below
+    'fingerprint' => 'my-installation-id',   // optional X-Fingerprint for order/make, see below
     'timeout' => 15,
     'connect_timeout' => 5,
 ]);
@@ -40,18 +40,26 @@ echo $api->balance();
 ```
 
 Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by default.
+It also paces its own requests to stay under the API's limits; see
+[Rate limits and the request queue](#rate-limits-and-the-request-queue).
 
-**Paying for orders.** Every order and renewal needs a payment system. Take one from
-`balancePaymentsList()` and set it once:
+**Paying for orders.** Every order and renewal needs a payment system, and `order/make` accepts
+only two: `balance` (the account balance) and `paddle_subscription` (the saved card, which needs an
+active card subscription). Set the code once, or pass it per call:
 
 ```php
-$payments = $api->balancePaymentsList();   // [['id' => '69e7…', 'name' => 'PayPal'], …]
-$api->setPaymentId($payments[0]['id']);
+$api->setPaymentCode('balance');     // or 'paddle_subscription' to pay with the saved card
+
+// per call, in the final options array:
+$api->orderMakeIpv4('USA', '1m', 1, null, null, 'my target', ['paymentCode' => 'balance']);
 ```
 
-This is the one place where an id is unavoidable: several payment systems share the same
-internal code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more),
-so the code cannot tell them apart. Everywhere else you use human-readable codes.
+`balancePaymentsList()` is **not** where order payments come from. It lists the systems for
+topping up the balance with `balanceAdd()`, never contains the balance itself, and none of its
+entries can pay for an order. For a top-up an id is unavoidable: several payment systems share the
+same internal code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more),
+so the code cannot tell them apart — see [Balance and auto top-up](#balance-and-auto-top-up).
+Everywhere else you use human-readable codes.
 
 <details>
 <summary>Pointing the client at another host (local testing)</summary>
@@ -67,7 +75,7 @@ TLS settings or local stubs.
 
 ## IDs in v2 are strings, not numbers
 
-Every identifier the API returns — `orderId`, IP address ids, auth ids, `paymentId` — is a MongoDB **ObjectId**: a 24-character hex string such as `66f0c2a1b4d3e5f6a7b8c9d0`. Do not cast them to `int`, do not compare them numerically, and store them as strings:
+Every identifier the API returns — `orderId`, IP address ids, auth ids, `paymentId` — is an **ObjectId**: a 24-character hex string such as `66f0c2a1b4d3e5f6a7b8c9d0`. Do not cast them to `int`, do not compare them numerically, and store them as strings:
 
 ```php
 $order = $api->orderMakeIpv4('USA', '1m', 1, null, null, 'my target');
@@ -78,14 +86,14 @@ $proxies = $api->proxyList('ipv4', ['orderId' => $orderId]);
 
 Casting to `int` truncates an ObjectId to a meaningless number (often `0`), which silently returns the wrong page of data instead of failing.
 
-**One exception:** resident *list* ids are numeric (`Long`), not ObjectIds. They are used by `residentListRename()`, `residentListRotation()`, `residentListDelete()`, `residentSubUserListRename()` and `proxyDownloadResident($id)`.
+**One exception:** resident *list* ids are numeric (64-bit integers), not ObjectIds. They are used by `residentListRename()`, `residentListRotation()`, `residentListDelete()`, `residentSubUserListRename()` and `proxyDownloadResident($id)`.
 
 ## Current order API
 
 Every `*Id` argument accepts **either** an ObjectId **or** the matching stable code. The server tries
-the value as an id first and falls back to a code lookup when it is not a valid id
-(`ClientApiService.normalizeOrderReferenceCodes`). Codes therefore go in **positionally** — there is
-no need for a chain of `null`s and an options array just to carry them:
+the value as an id first and falls back to a code lookup when it is not a valid id. Codes therefore
+go in **positionally** — there is no need for a chain of `null`s and an options array just to carry
+them:
 
 ```php
 // referenceList('mobile') returns ['items' => <section>]; without a type it returns a map of sections
@@ -114,77 +122,6 @@ $mix = $api->orderCalcMix($package['id'], '1m', 10);
 
 The remaining `null`s above are genuine optional values (`authorization`, `coupon`), not placeholders.
 
-### Listing orders
-
-```php
-$orders = $api->orderList([
-    'status'  => 'PAYED',       // PAYED | NOT_PAYED | RETURN — the status_type of the response
-    'sort_by' => 'date_insert', // date_insert | summ | status
-    'order'   => 'desc',
-    'page'    => 1,
-    'limit'   => 20,
-]);
-
-$all = $api->orderList(); // the same call with no filters at all
-```
-
-Every filter is optional and every name is the snake_case one of v1: `order_id`, `start_date`,
-`end_date`, `status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`. The same
-endpoint answers legacy-API clients through the reverse mirror, so the spelling is theirs.
-
-`data` is not a flat list but a `metadata` + `items` pair, and `metadata` is always present:
-without `limit` it reports `total_pages => 1`, `current_limit => 0` and the whole list in `items`.
-`summ` and `items[]['price']` are **strings with the currency already in them** (`'$25.00'`),
-`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`)
-strings. `id` is the legacy bitrix number as a string; our ObjectId is `order_id` — the same value
-`proxyList()` returns as `order_id`.
-
-### Residential and scraper orders need a fingerprint
-
-`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and scraper orders are not created without it at all** — the order service answers `Header X-Fingerprint is required` and nothing is ordered.
-
-```php
-$api = new Api(['key' => 'YOUR_API_KEY', 'fingerprint' => 'my-installation-id']);
-// or later:
-$api->setFingerprint('my-installation-id');
-// or for a single call:
-$api->orderMakeResident('tarif-code', null, ['fingerprint' => 'my-installation-id']);
-```
-
-Any opaque string is accepted — the server does not validate its shape — but it must be a **stable identifier of your installation**. The SDK deliberately does not generate one: a value randomized per process would break the anti-fraud and affiliate attribution the header exists for.
-
-Ordering resident or scraper without a fingerprint raises `\InvalidArgumentException` locally, rather than spending a round trip on a request the server is certain to reject.
-
-## Renewing proxies
-
-You renew by the same IP addresses `proxyList()` gave you. No ids, no separators:
-
-```php
-$ipv4 = $api->proxyList('ipv4')['items'];
-$ips  = array_column($ipv4, 'ip');            // ['1.2.3.4', '5.6.7.8']
-
-$quote = $api->prolongCalc('ipv4', $ips, '1m');   // price first
-echo $quote['total'];
-
-$order = $api->prolongMake('ipv4', $ips, '1m');   // deducts money
-echo $order['orderId'];
-```
-
-What to send per type, and which `proxyList()` field it is built from:
-
-| Type | Pass this | Built from |
-| --- | --- | --- |
-| `ipv4`, `isp`, `mix`, `mix_isp` | the plain address, `"1.2.3.4"` | `ip` |
-| `ipv6` | the address, `"host:port"` — e.g. `"1.2.3.4:26000"` | `ip` |
-| `mobile` | `"ip:port_http:port_socks"`, e.g. `"1.2.3.4:50100:50101"` | `ip`, `port_http`, `port_socks` |
-
-For `ipv6` the `ip` field already holds the gateway together with the port
-(`"1.2.3.4:26000"`), while `ip_only` holds the bare gateway — so pass `ip` as it comes, exactly
-like every other type.
-
-`prolongMake()` throws `ApiException` when the balance is short — the renewal did not happen.
-Check the price with `prolongCalc()` first if you want to handle that gracefully.
-
 The final options array is for fields **without** a positional argument: `uptime`, `mixId`/`mixCode`,
 `generateAuth`, and `protocol` outside the IPv6 helpers. The explicit `*Code` keys (`countryCode`,
 `periodCode`, `operatorCode`, `mixCode`, `tarifCode`, `paymentCode`) still work and win over the
@@ -208,7 +145,7 @@ Read `id`, put it in the matching `*Id` argument. That is the whole rule:
 | `rotationId` | **minutes as an integer**, `0` = By Link — the one `id` that is a number, not a code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
 | `mix` (first argument of `orderCalcMix` / `orderMakeMix`) | mix package code — exact match | `reference/list/mix` → `quantities[].id`, e.g. `europe-2-mix_IPv4` |
 | `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `items.tarifs[].id` |
-| `paymentId` | payment-system ObjectId — the one unavoidable id | `balance/payments/list` → `items[].id` (see "Paying for orders" above) |
+| `paymentId` / `paymentCode` | `balance` or `paddle_subscription` (the saved card) — the only two accepted for orders and renewals | these two codes, no lookup needed (see "Paying for orders" above); `balance/payments/list` lists top-up systems for `balanceAdd()` only |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
 publishes them. Code resolution happens in `order/calc`, `order/make`, `prolong/calc` and
@@ -221,14 +158,130 @@ need for it.
 
 For a fully custom payload use `orderCalc(array $payload)` or `orderMake(array $payload)`.
 
+### Listing orders
+
+```php
+$orders = $api->orderList([
+    'status'  => 'PAYED',       // PAYED | NOT_PAYED | RETURN — the status_type of the response
+    'sort_by' => 'date_insert', // date_insert | summ | status
+    'order'   => 'desc',
+    'page'    => 1,
+    'limit'   => 20,
+]);
+
+$all = $api->orderList(); // the same call with no filters at all
+```
+
+Every filter is optional. Query filters and response fields use snake_case names such as
+`start_date` and `is_extend`; the full filter set is `order_id`, `start_date`, `end_date`,
+`status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`. `order_id` matches either
+of the two order identifiers described below.
+
+`data` is not a flat list but a `metadata` + `items` pair, and `metadata` is always present:
+without `limit` it reports `total_pages => 1`, `current_limit => 0` and the whole list in `items`.
+`summ` and `items[]['price']` are **strings with the currency already in them** (`'$25.00'`),
+`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`)
+strings. `id` is a numeric order ID sent as a string; the ObjectId is `order_id` — the same value
+`proxyList()` returns as `order_id`, and the one to pass when renewing `ipv6`, `mix` and `mix_isp`
+(see [Renewing proxies](#renewing-proxies)).
+
+### The optional `X-Fingerprint` header
+
+`order/make` accepts an optional `X-Fingerprint` header, used for anti-fraud checks and affiliate attribution when present. **It is not required**: orders placed with an API key are created without it in every section, residential and scraper included. The SDK sends the header whenever a value is configured and never refuses an order when it is missing.
+
+```php
+$api = new Api(['key' => 'YOUR_API_KEY', 'fingerprint' => 'my-installation-id']);
+// or later:
+$api->setFingerprint('my-installation-id');
+// or for a single call:
+$api->orderMakeResident('tarif-code', null, ['fingerprint' => 'my-installation-id']);
+```
+
+Any opaque string is accepted — the server does not validate its shape — but if you send one, make it a **stable identifier of your installation**. The SDK deliberately does not generate one: a value randomized per process would break the anti-fraud and affiliate attribution the header exists for. An empty value counts as unset, and no header is sent.
+
+## Renewing proxies
+
+What a renewal is addressed by depends on the type. `ipv4`, `isp` and `mobile` are renewed per
+proxy — by the address `proxyList()` shows or by the proxy's `id`. **`ipv6`, `mix` and `mix_isp`
+are renewed as whole orders by `orderIds`** — pass the `order_id` of each order, and every active
+proxy of that type in it is renewed (for `mix` / `mix_isp`: the mix packages of those orders).
+
+```php
+// ipv4 / isp / mobile — per proxy, by address (or by the proxy id)
+$ipv4 = $api->proxyList('ipv4')['items'];
+$ips  = array_column($ipv4, 'ip');                // ['1.2.3.4', '5.6.7.8']
+
+$quote = $api->prolongCalc('ipv4', $ips, '1m');   // price first
+echo $quote['total'];
+
+$order = $api->prolongMake('ipv4', $ips, '1m');   // deducts money
+echo $order['orderId'];                           // the first of $order['orderIds']
+
+// ipv6 / mix / mix_isp — whole orders, by order id
+$ipv6   = $api->proxyList('ipv6')['items'];
+$orders = array_values(array_unique(array_column($ipv6, 'order_id')));
+
+$order = $api->prolongMake('ipv6', $orders, '1m');
+print_r($order['orderIds']);                      // every renewed order
+```
+
+What to pass per type, and which `proxyList()` field it comes from:
+
+| Type | Pass this | Built from | Sent as |
+| --- | --- | --- | --- |
+| `ipv4`, `isp` | the plain address, `"1.2.3.4"` — or the proxy id | `ip` — or `id` | `ips` — or `ipIds` |
+| `mobile` | `"ip:port_http:port_socks"`, e.g. `"1.2.3.4:50100:50101"` — or the proxy id | `ip`, `port_http`, `port_socks` — or `id` | `ips` — or `ipIds` |
+| `ipv6`, `mix`, `mix_isp` | the order id | `order_id` (the same value as in `orderList()`) | `orderIds` |
+
+The SDK routes each value by its shape: a value with a dot or a colon is an address and goes to
+`ips`, anything else is an id and goes to `ipIds` for `ipv4` / `isp` / `mobile` and to `orderIds` for
+`ipv6` / `mix` / `mix_isp`. To set a field yourself, pass `ipIds`, `ips` or `orderIds` in the final
+options array; empty lists are never sent.
+
+**For `ipv4`, `isp` and `mobile` pass either ids or addresses in one call, not both.** Given both
+`ipIds` and `ips`, the server reads `ipIds` and ignores `ips`, so the addresses would silently drop
+out of a paid renewal. The SDK therefore throws `\InvalidArgumentException` — "Mixing proxy ids and
+addresses in one call is not supported: pass either ids or addresses" — before anything is sent,
+whether the mix sits in one list or is split between the list and the options array. Renew ids and
+addresses in two calls. For `ipv6`, `mix` and `mix_isp` a mixed list is still routed (ids to
+`orderIds`, addresses to `ips`), and the server rejects the address part itself.
+
+The server refuses a selection of the wrong kind instead of guessing. An address or a proxy id for
+`ipv6` / `mix` / `mix_isp` fails with `[ips] is not applicable for ipv6: prolong by [orderIds]` (or
+`[ipIds] …`); an order id for `ipv4` / `isp` / `mobile` fails with
+`[orderIds] is not applicable for ipv4: prolong by [ipIds]`. An order that is not yours or has no
+active proxies of that type — or an empty list — fails the whole request with `Incorrect orderIds`
+(code 29), and nothing is renewed. `quantity` and `items` in the `prolongCalc()` answer show what a
+renewal actually covers.
+
+`prolongMake()` answers `orderId`, `orderIds`, `total`, `listBaseOrderNumbers` and `balance`.
+`orderIds` lists every renewed order — one request can renew several — and `orderId` is
+`orderIds[0]`. `listBaseOrderNumbers` holds one base order number per renewed order (per package
+for `mix` / `mix_isp`).
+
+`prolongMake()` throws `ApiException` when the balance is short — the renewal did not happen.
+Check the price with `prolongCalc()` first if you want to handle that gracefully.
+
+> **`ids`, `orderSeparatorIds` and `orderSeparatorId` are gone** from the renewal body — the server
+> no longer reads them. Passing one in the options array throws `\InvalidArgumentException` that
+> names the replacement instead of dropping it silently: `ids` → `ipIds` (ipv4/isp/mobile) or
+> `orderIds` (ipv6/mix/mix_isp); `orderSeparatorIds` / `orderSeparatorId` → `orderIds`. The list is
+> `Api::PROLONG_REMOVED_FIELDS`.
+
 ## Automatic renewal
 
 `prolongMake()` charges you now. `autoprolong/*` only arms a charge that happens later, without you present — a separate branch of the API, not a flag on prolong.
+
+The selection works exactly as in [Renewing proxies](#renewing-proxies): addresses or proxy ids for `ipv4`, `isp` and `mobile` (one kind per call — a mix throws), order ids for `ipv6`, `mix` and `mix_isp`, and the removed `ids` / `orderSeparatorIds` / `orderSeparatorId` are refused by name.
 
 ```php
 $api->autoProlongCalc('ipv4', ['1.2.3.4'], '1m', ['paymentId' => 'balance']);
 $api->autoProlongEnable('ipv4', ['1.2.3.4'], '1m', ['paymentId' => 'balance']);
 $api->autoProlongDisable('ipv4', ['1.2.3.4']);
+
+// ipv6 / mix / mix_isp — the whole order at once
+$api->autoProlongEnable('ipv6', [$orderId], '1m', ['paymentId' => 'balance']);
+$api->autoProlongDisable('ipv6', [$orderId]);
 ```
 
 `paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a one-off Paddle checkout needs a browser redirect a headless client cannot complete. With `paddle_subscription` also pass `subscriptionId`.
@@ -241,11 +294,13 @@ $api->autoProlongEnable('resident', [], null, ['paymentId' => 'balance', 'tarifI
 $api->autoProlongDisable('resident');
 ```
 
+**For `resident` pass no selection at all.** A non-empty `$ids` list, `ipIds`, `ips` or `orderIds` throws `\InvalidArgumentException` — "resident auto-prolong applies to the whole package: do not pass proxy or order ids" — before anything is sent. The SDK deliberately does not strip the selection: a `disable` meant for a few addresses would otherwise switch off auto-renewal for the whole package. (The server refuses such a body as well, with `[ipIds] is not applicable for resident: auto-prolong applies to the whole package`.) An empty list is fine, and a period is neither needed nor sent.
+
 Three things about the answers before you parse them:
 
-* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and `ids` can cover more proxies than you sent.
+* **`ipIds` and `orderIds` are not an echo.** `enable` and `disable` report the proxies actually affected in `ipIds` (the `id` of `proxyList()`) and their orders in `orderIds`. For `ipv6`, `mix` and `mix_isp` the whole order is switched at once, so `quantity` and `ipIds` cover every active proxy of the orders you sent. For `resident` both lists are empty and `quantity` is `1`. The proxy list used to be called `ids`.
 * **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled* `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
-* **Residential fills different fields.** `days` and `chargeDate` are null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead.
+* **Residential fills different fields.** `chargeDate` is null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead, and `days` is the tariff's own period.
 
 `scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
 
@@ -279,15 +334,15 @@ A bad API key, a caller IP outside the key's allowlist and an exceeded request l
 ]
 ```
 
-Because the exception message is built from `errors[0]`, it always reads `Error api key` in all three cases. There is **no HTTP 429**. Never branch on the message alone:
+Because the exception message is built from `errors[0]`, it always reads `Error api key` in all three cases. The API itself never answers this with HTTP 429 — a 429 comes only from the edge in front of it, and the SDK retries it (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)). Never branch on the message alone:
 
 ```php
 try {
     $api->proxyList('ipv4');
 } catch (ApiException $e) {
     if ($e->isAccessError()) {
-        // key / IP allowlist / rate limit — the server does not say which.
-        // Log every message, then back off and retry rather than treating it as a hard failure.
+        // key / IP allowlist / rate limit — the server does not say which, so the SDK
+        // does not retry it. Log every message; retry later only if key and IP are right.
         error_log(implode(' | ', $e->getMessages()));
     }
     throw $e;
@@ -310,6 +365,84 @@ try {
 
 Calculation/prolong responses with `status=error`, useful `data`, and an empty `errors` array are returned as warning data instead of causing a parser failure. Inspect `$api->getLastResponseStatus()` if this distinction matters.
 
+## Rate limits and the request queue
+
+The API accepts up to 1000 requests per minute per key and answers anything above that with the
+[access-error triple](#access-errors-are-a-fixed-triple--read-the-whole-array), which cannot be told
+apart from a wrong key or a blocked IP. So the client paces its own requests — by default, with
+nothing to set up:
+
+- **One window for everything.** At most `requestsPerMinute` (1000) requests start within any
+  60 seconds — reads, writes and payments together. It is a sliding window, not a token bucket, so
+  there is no burst above the limit: once 1000 requests have started, the next one waits until the
+  oldest of them is 60 seconds old.
+- **One lane for writes.** Requests that change something go through a single queue per `Api`
+  instance, one at a time. Each starts no earlier than `writeIntervalMs` (1000 ms) after the
+  previous write or payment started; a payment also no earlier than `moneyIntervalMs` (2000 ms)
+  after the previous payment started. The intervals count from the *start* of the previous request, so a slow
+  request does not add to the wait.
+- **Reads do not queue.** They wait only for the window — the `*Calc()` methods included: they are
+  `POST`, but they change nothing.
+- **HTTP 429 is retried.** It comes from the rate limit at the edge in front of the API: the request
+  never reached the API, so repeating it is safe, even for a payment. The SDK waits what
+  `Retry-After` says (seconds or an HTTP date; 2 seconds when it is missing or unreadable, never
+  more than 60 seconds) and sends the same request again, up to `maxRetries` (3) times. After that
+  it throws the usual `ApiException`, with `getHttpStatus() === 429`. A retried write keeps its place
+  in the lane, every attempt counts against the window, and the next write's intervals count from
+  the last attempt.
+- **Nothing else is retried.** Code 57, `Prolong for this order is already in progress`, reaches you
+  as it is — repeating a renewal automatically could renew the order twice. So does the access-error
+  triple, which may just as well mean a wrong key or IP. Transport errors (timeouts, refused
+  connections) are not retried either.
+
+What goes where — by the endpoint a method calls, not by its HTTP method:
+
+| Kind | Methods |
+| --- | --- |
+| payment: lane, 2 s apart | `orderMake()` and every `orderMake*()` helper, `prolongMake()`, `balanceAdd()` |
+| write: lane, 1 s apart | `autoProlongEnable()`, `autoProlongDisable()`, `authAdd()`, `authAddIp()`, `authChange()`, `authDelete()`, `proxyReplace()`, `proxyCommentSet()`, `balanceAutoTopupSet()`, `residentListAdd()`, `residentListRename()`, `residentListRotation()`, `residentListTools()`, `residentListDelete()`, `residentSubUserCreate()`, `residentSubUserUpdate()`, `residentSubUserDelete()`, `residentSubUserListAdd()`, `residentSubUserListRename()`, `residentSubUserListRotation()`, `residentSubUserListTools()`, `residentSubUserListDelete()` |
+| read: window only | everything else — lists and `get` calls, `orderCalc*()`, `prolongCalc()`, `autoProlongCalc()`, `referenceList()`, downloads, `residentGeo*()`, consumption and traffic statistics |
+
+Change the defaults, or switch the queue off, with the `rateLimit` config key:
+
+```php
+$api = new Api([
+    'key' => 'YOUR_API_KEY',
+    'rateLimit' => [
+        'requestsPerMinute' => 600,   // default 1000
+        'writeIntervalMs'   => 1500,  // default 1000
+        'moneyIntervalMs'   => 3000,  // default 2000
+        'maxRetries'        => 5,     // retries of HTTP 429, default 3; 0 = none
+    ],
+]);
+
+// the behaviour from before the queue: no waiting and no retries at all
+$api = new Api(['key' => 'YOUR_API_KEY', 'rateLimit' => false]);  // short for ['enabled' => false]
+```
+
+`'rateLimit' => false` is short for `['enabled' => false]`, and `'rateLimit' => true` means all
+defaults — the same as leaving the key out. In an array, omitted keys keep their defaults. An
+unknown key or an invalid value — anything other than an array or a boolean, too — throws
+`\InvalidArgumentException` when the client is created, so a typo cannot silently fall back to a
+default.
+
+**The queue belongs to one `Api` instance.** Separate instances and separate processes using the
+same key know nothing about each other. Under php-fpm or mod_php nothing survives from one web
+request to the next, so every request starts with a new, empty queue, and requests served in
+parallel run in separate processes. The queue therefore helps scripts, workers and daemons that make
+several calls in one process — create the instance once there and reuse it. When several processes share a key they
+can still exceed the limits together, and the server may then answer with the access-error triple
+or with code 57. Both reach you as `ApiException`; the SDK does not retry them.
+
+**Waiting blocks.** The SDK waits with `usleep()`, so the call simply returns later; there is no
+busy-waiting. Calls on one instance run one after another, so writes cannot overlap. If your
+transport yields (fibers, an event loop) and a second write starts on the same instance while the
+first is still in flight, the second is not sent: it throws `\LogicException`.
+
+For tests, `rateLimit` also accepts `clock` — a callable returning the current time in milliseconds
+(monotonic) — and `sleeper`, a callable that receives the milliseconds to wait. Together they let a
+test run the queue on fake time.
+
 ## Balance and auto top-up
 
 ```php
@@ -322,7 +455,7 @@ foreach ($api->balancePaymentsList() as $ps) {
 $url = $api->balanceAdd(25, '66f0c2a1b4d3e5f6a7b8c9d0');
 ```
 
-`balance/add` accepts **only** `paymentId`. Unlike order and prolong endpoints, it does not resolve a `paymentCode`, so `balanceAdd()` throws `\InvalidArgumentException` when only a code is configured instead of sending `paymentId: null` and returning the opaque `Set existed [paymentId]`. The internal balance itself is not in the payment list — you cannot top up the balance with the balance.
+`balance/add` accepts **only** `paymentId`. Unlike order and prolong endpoints, it does not resolve a `paymentCode`, so `balanceAdd()` throws `\InvalidArgumentException` when only a code is configured instead of sending `paymentId: null` and returning the opaque `Set existed [paymentId]` — pass the top-up system's id explicitly, as above, even when `setPaymentCode('balance')` is configured for orders. The internal balance itself is not in the payment list — you cannot top up the balance with the balance — and the list is for top-ups only: orders and renewals are paid with `balance` or `paddle_subscription`.
 
 Auto top-up charges a saved Paddle payment method when the balance drops below `threshold`:
 
@@ -360,7 +493,7 @@ Valid reasons: `NOT_WORK`, `INCORRECT_LOCATION`, `CANT_CHANGE_NETWORK`, `LOW_SPE
 - `residentGeo()` returns a **JSON** file (`geo.json`) with the full geo tree — countries, regions, cities, ISPs — and `residentGeoIsp()` returns `isp.json`. Neither is a zip archive.
 - `ext` on the download endpoints is `txt`, `csv` or a custom line template built from `%ip%`, `%port%`, `%login%`, `%user%`, `%password%`, `%protocol%`, `%rotation_link%`. It must be at most 250 characters and must not contain CR, LF, `/` or `\` — the server rejects those with a bare plain-text HTTP 400 outside the envelope, so the SDK validates it first. `ext` may be given positionally or inside the `$filters` array.
 - `package_key` works only on `proxyDownload('subresident', ...)`. The literal `/proxy/download/resident` route ignores it and would export the parent package instead, so passing it there throws.
-- `prolongCalc` / `prolongMake` take the IP addresses from `proxyList()` and a period code — see [Renewing proxies](#renewing-proxies). ObjectIds are still accepted if you happen to have them, and MIX renewals are expanded to the whole package server-side, so there is nothing extra to pass.
+- `prolongCalc` / `prolongMake` take addresses or proxy ids for `ipv4` / `isp` / `mobile` (one kind per call) and order ids (`order_id`) for `ipv6` / `mix` / `mix_isp`, which are renewed only as whole orders, plus a period code — see [Renewing proxies](#renewing-proxies).
 - `residentList()` returns `data` as a flat array of lists — there is no `items` wrapper.
 - `residentTrafficDetails()` takes the package key as `packageKey` **or** `key` (plus optional `login`, `date_start`, `date_end`). `package_key`, the name used across `residentsubuser/*`, is not accepted there and yields `key is required`.
 - `residentPackage()` reports `expired_at` as a string (`d.m.Y H:i:s`), while `residentSubUserPackages()` reports it as a PHP date **object** — read `$item['expired_at']['date']`.
@@ -378,17 +511,19 @@ composer test          # or: vendor/bin/phpunit
 
 The suite is **offline**: `Api` accepts an injected HTTP client through the `client` config key, so the tests drive the SDK with canned envelopes and inspect the request it built. They answer "does the SDK assemble and parse correctly", not "is the server up" — nothing is mocked away that the SDK itself is responsible for.
 
-Every assertion mirrors the behaviour of `client-api-service`, not of this README: docs can drift from the server without anyone noticing, a test cannot. What is covered:
+Every assertion follows the behaviour of the v2 API server, not of this README: docs can drift from the server without anyone noticing, a test cannot. What is covered:
 
 - the api key as a **path segment** (v2 puts it in the URL, not a header) and URL-encoding of it;
 - the envelope — business errors arrive with **HTTP 200**, so the status code proves nothing; the deliberately uninformative three-error access triple must stay fully visible;
-- local gates that save a round trip on a certain refusal: `customTargetName` for ipv4/ipv6/isp, `balanceAdd` with only a `paymentCode`, `X-Fingerprint` for residential and scraper orders;
+- local gates that save a round trip on a certain refusal: `customTargetName` for ipv4/ipv6/isp, `balanceAdd` with only a `paymentCode`;
+- `X-Fingerprint` sent on `order/make` when configured (or passed per call) and never required — residential and scraper orders go out without it;
 - the **split precedence** of `*Id` / `*Code` — the code wins for country/period/payment, the *id* wins for mix/operator/rotation/tarif — and the fact that the raw `orderCalc(array)` form leaves a caller-built body untouched;
 - `generateAuth` reaching `order/make` only, since `order/calc` silently drops it;
 - auto top-up: the caps removed from the contract on 2026-08-18 are rejected **by name**, partial updates send only what was passed, and `false` / `0` are not mistaken for "unset";
 - download routing — a custom `ext` with a slash is legal on `/proxy/download/{type}` but not on the literal `/proxy/download/resident`, which also ignores `package_key`;
 - `data: null` inside a `status: "success"` delete being reported as `not-found` rather than as a successful deletion;
-- renewal by the addresses `proxyList()` returns, routed into `ips` / `ids` by shape;
-- auto-renewal: `scraper` refused locally, `paymentId` required for calc and enable but not for disable, and the package-shaped residential body.
+- renewal routing by type and shape: addresses into `ips`, proxy ids into `ipIds` for ipv4/isp/mobile, order ids into `orderIds` for ipv6/mix/mix_isp (whatever the spelling of the type), no empty lists; ids mixed with addresses refused locally for ipv4/isp/mobile, and the removed `ids` / `orderSeparatorIds` / `orderSeparatorId` refused by name, all before the request;
+- auto-renewal: `scraper` refused locally, `paymentId` required for calc and enable but not for disable, the package-shaped residential body, and any residential selection refused rather than stripped;
+- the request queue, on a fake clock so no test waits: payments 2 s and writes 1 s apart counted from the previous start, a payment after a write waiting for the later of the two, reads never held by the lane, the sliding window shared by all kinds of requests, HTTP 429 retried after `Retry-After` (2 s by default, 60 s at most, HTTP dates too) and given up after `maxRetries` with status 429, code 57 and the access triple never retried, the disabled mode and the `false` / `true` shorthand, a second write on a busy instance refused, and every SDK method paced by the endpoint it calls.
 
-To exercise a local `client-api-service`, run it on port 7995, configure the local `baseUrl` shown above, use a development API key and call read-only endpoints first (`balance`, `authList`, `residentList`).
+To exercise a locally running API server, point the local `baseUrl` shown above at it (port 7995 in that example), use a development API key and call read-only endpoints first (`balance`, `authList`, `residentList`).

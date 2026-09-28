@@ -5,8 +5,8 @@ namespace ProxySeller\Userapi;
 /**
  * Error returned by Client API.
  *
- * The HTTP status is intentionally stored separately from the legacy business
- * error code because Client API commonly returns business errors with HTTP 200.
+ * The HTTP status is intentionally stored separately from the business error code
+ * of the envelope because Client API commonly returns business errors with HTTP 200.
  *
  * Сообщение исключения — это errors[0].message. Одного его недостаточно: ошибки доступа
  * (битый ключ / IP не в allowlist / превышенный лимит запросов) сервер отдаёт фиксированной
@@ -122,8 +122,8 @@ class ApiException extends \RuntimeException {
 
     /**
      * customData первой ошибки, у которой оно есть. Сюда сервер кладёт границы значений:
-     * для balance/autotopup/set это ['minAmount' => ..., 'minThreshold' => ...,
-     * 'minDailyCountCap' => ...] (ClientApiService.setAutoTopup).
+     * для balance/autotopup/set это ['minAmount' => ..., 'minThreshold' => ...]
+     * (minDailyCountCap ушёл из контракта 18.08.2026 вместе с dailyCountCap).
      * @return mixed|null
      */
     public function getCustomData() {
@@ -137,7 +137,7 @@ class ApiException extends \RuntimeException {
 
     /**
      * Это ошибка доступа (битый apiKey / IP не разрешён / превышен лимит запросов)?
-     * Повторяет LegacyClientApiErrorHelper.isAccessError на бэкенде. Различить три причины
+     * Повторяет серверное правило распознавания ошибок доступа. Различить три причины
      * нельзя — сервер намеренно отдаёт одинаковую тройку, — но отличить их от бизнес-ошибок
      * (нет денег, неверная страна) можно и нужно: ретраить имеет смысл только rate limit.
      * @return boolean

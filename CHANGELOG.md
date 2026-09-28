@@ -6,22 +6,82 @@ All notable changes to this package. This project follows [Semantic Versioning](
 
 Catching up with server changes made after 2.0.
 
+### Breaking
+
+- **Renewals are addressed by type.** `prolongCalc()`, `prolongMake()` and
+  `autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()` now send `ipIds` (the proxy
+  `id`) or `ips` (the address) for `ipv4`, `isp` and `mobile`, and `orderIds` (`order_id` from
+  `proxyList()` or `orderList()`) for `ipv6`, `mix` and `mix_isp` — the server renews those three
+  only as whole orders, every active proxy of the type in them (the mix packages for `mix` /
+  `mix_isp`). Values are still routed by shape: an address goes to `ips`, anything else to `ipIds`
+  or `orderIds` depending on the type, which is normalized the way the server does it (`MIX-ISP`
+  counts as `mix_isp`). Code that renewed `ipv6`, `mix` or `mix_isp` by address (`host:port` /
+  `ip`) or by proxy id must pass order ids now: the server refuses the old selection with
+  `[ips] is not applicable for ipv6: prolong by [orderIds]` (or `[ipIds] …`), and an order that is
+  not yours or has no active proxies of that type fails the whole request with
+  `Incorrect orderIds` (code 29).
+- **`ids`, `orderSeparatorIds` and `orderSeparatorId` are gone from the renewal body.** The server
+  no longer reads them. The SDK no longer sends `ids`, and passing any of the three in the options
+  array throws `\InvalidArgumentException` naming the replacement instead of being dropped
+  silently: `` `ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp) ``,
+  `` `orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds` ``.
+- **Proxy ids and addresses cannot be mixed in one call for `ipv4`, `isp` and `mobile`.** Given both
+  `ipIds` and `ips`, the server reads `ipIds` and ignores `ips`, so the addresses would silently drop
+  out of a paid renewal. The SDK throws `\InvalidArgumentException` ("Mixing proxy ids and addresses
+  in one call is not supported: pass either ids or addresses") instead of sending both — for a mixed
+  list as well as for a list combined with the options array. `ipv6` / `mix` / `mix_isp` still
+  route a mixed list (ids → `orderIds`, addresses → `ips`) and leave the address part to the server.
+- **Residential auto-renewal refuses a selection.** With `type = 'resident'` a non-empty `$ids` list,
+  `ipIds`, `ips` or `orderIds` throws `\InvalidArgumentException` ("resident auto-prolong applies to
+  the whole package: do not pass proxy or order ids") instead of being stripped silently: a
+  `disable` meant for a few addresses would otherwise switch off the whole package. An empty list is
+  fine, and the period is still dropped.
+- **`autoprolong/enable` and `autoprolong/disable` answer `ipIds` instead of `ids`** — the proxies
+  actually affected — plus a new `orderIds` with their orders. Both are empty for `resident`.
+
 ### Added
 
-- **`orderList()`** for `GET order/list`. Every filter is optional and keeps the snake_case names
-  of v1 (`order_id`, `start_date`, `end_date`, `status`, `is_extend`, `auto_order`, `page`,
-  `limit`, `sort_by`, `order`), because legacy-API clients reach the same endpoint through the
-  reverse mirror. `data` is a `metadata` + `items` pair rather than a flat list, and `summ` /
-  `items[]['price']` are currency strings (`'$25.00'`), not numbers.
+- **`orderList()`** for `GET order/list`. Every filter is optional; query filters and response
+  fields use snake_case names (`order_id`, `start_date`, `end_date`, `status`, `is_extend`,
+  `auto_order`, `page`, `limit`, `sort_by`, `order`). `data` is a `metadata` + `items` pair rather
+  than a flat list, `summ` / `items[]['price']` are currency strings (`'$25.00'`), not numbers, and
+  `id` is a numeric order ID sent as a string next to the ObjectId `order_id`.
 - **`autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()`** for
   `autoprolong/{calc,enable,disable}/{type}`. `paymentId` is mandatory on calc and enable and is
   restricted to `balance` / `paddle_subscription`; `type = 'resident'` sends the package-shaped
-  body (`paymentId`, optional `tarifId`) and takes no address selection.
-- **`X-Fingerprint` on `order/make`.** Configure it as `['fingerprint' => ...]`, with
-  `setFingerprint()`, or per call via `$options['fingerprint']`. Residential and scraper orders
-  now fail locally with `\InvalidArgumentException` when it is unset, instead of being rejected by
-  the server.
+  body (`paymentId`, optional `tarifId`) and takes no selection — passing one throws (see Breaking).
+- **Optional `X-Fingerprint` on `order/make`.** Configure it as `['fingerprint' => ...]`, with
+  `setFingerprint()`, or per call via `$options['fingerprint']`; the SDK sends it whenever a value
+  is set and never requires it. Orders placed with an API key are created without it in every
+  section, residential and scraper included, so there is no local gate any more — earlier builds of
+  this branch refused residential and scraper orders without it with `\InvalidArgumentException`.
 - **`maxLine`** on `proxy/download/resident` — the only route that accepts it.
+- **`Api::ORDER_PROLONG_TYPES`** — the types renewed as whole orders by `orderIds` (`ipv6`, `mix`,
+  `mix_isp`) — and **`Api::PROLONG_REMOVED_FIELDS`**, the removed selection fields with the message
+  that names their replacement.
+
+### Changed
+
+- **Behaviour change: requests are now paced by default** (see
+  [Rate limits and the request queue](README.md#rate-limits-and-the-request-queue)). All requests
+  share a sliding window of `requestsPerMinute` (1000) starts per 60 seconds. Writes and payments go
+  through one lane per `Api` instance — one at a time, each at least `writeIntervalMs` (1000 ms)
+  after the previous write or payment started, payments (`orderMake*()`, `prolongMake()`,
+  `balanceAdd()`) also at least `moneyIntervalMs` (2000 ms) after the previous payment; reads,
+  `*Calc()` included, wait only for the window. HTTP 429 from the edge in front of the API is retried after `Retry-After`
+  (2 s when missing or unreadable, 60 s at most) up to `maxRetries` (3) times, then thrown as
+  `ApiException` with HTTP status 429. Envelope errors — code 57 and the access-error triple — are
+  never retried. A call may therefore block (`usleep()`) where it used to go out at once. Tune it
+  with the new `rateLimit` config key (`enabled`, `requestsPerMinute`, `writeIntervalMs`,
+  `moneyIntervalMs`, `maxRetries`; unknown keys and invalid values throw
+  `\InvalidArgumentException`); `'rateLimit' => false`, short for `['enabled' => false]`, restores
+  the previous behaviour exactly, and `true` means all defaults. The queue lives in the instance: separate instances and processes do not
+  coordinate, and under php-fpm every web request starts with a new, empty queue.
+- **`prolongMake()` returns `orderIds`** — every renewed order, since one request can renew several.
+  `orderId` stays and equals `orderIds[0]`; `listBaseOrderNumbers` carries one base order number per
+  renewed order (per package for `mix` / `mix_isp`).
+- **Empty selection lists are not sent**, whether they come from the positional argument or from the
+  options array; a single value passed there is wrapped into a list.
 
 ### Removed
 
@@ -35,22 +95,29 @@ Catching up with server changes made after 2.0.
 ### Tests
 
 - **A test suite, for the first time.** PHPUnit as a dev dependency, `composer test`,
-  33 offline tests. `Api` already accepted an injected HTTP client through the `client`
+  64 offline tests. `Api` already accepted an injected HTTP client through the `client`
   config key, so no production code had to change to make it testable.
   Coverage matches the guard suites the other four SDKs carry: the api key as a path
   segment, the `200`-with-an-error envelope and the access triple, every local gate
-  (`customTargetName`, `balanceAdd`, `X-Fingerprint`), the split `*Id` / `*Code`
-  precedence, `generateAuth` on `order/make` only, the removed auto top-up caps,
-  download routing, `not-found` deletes, address-vs-id renewal routing, auto-renewal and the
-  v1 filter names of `order/list`.
+  (`customTargetName`, `balanceAdd`), `X-Fingerprint` sent when set but never required, the split
+  `*Id` / `*Code` precedence, `generateAuth` on `order/make` only, the removed auto top-up caps,
+  download routing, `not-found` deletes, type-aware renewal routing (`ips` / `ipIds` /
+  `orderIds`, no empty lists), the local refusal of ids mixed with addresses and of the removed
+  `ids` / `orderSeparatorIds` / `orderSeparatorId`, auto-renewal with the residential selection
+  refused, and the snake_case filter names of `order/list`.
+- **Request-queue tests** (`tests/RateLimitTest.php`) run on an injected fake clock and sleeper, so
+  they take no real time: payment and write spacing, the later-of-both wait of a payment after a
+  write, reads never held by the lane, the sliding window, HTTP 429 retries (`Retry-After` in
+  seconds or as an HTTP date, the 2 s default, the 60 s cap, giving up with status 429), code 57
+  and the access triple not retried, the disabled mode and the `false` / `true` shorthand, a second
+  write refused while one is in flight, and the category of every SDK method.
 
 ### Fixed
 
 - **`*Code` no longer overrides a paired `*Id`** for `mixId`, `operatorId`, `rotationId` and
-  `tarifId`. The server applies the code on those four only while the id is empty
-  (`ClientApiService::normalizeOrderReferenceCodes`), so a caller who filled both halves silently
-  got the wrong package, operator, rotation or tariff. `countryCode`, `periodCode` and
-  `paymentCode` keep priority — there the server does prefer the code.
+  `tarifId`. The server applies the code on those four only while the id is empty, so a caller who
+  filled both halves silently got the wrong package, operator, rotation or tariff. `countryCode`,
+  `periodCode` and `paymentCode` keep priority — there the server does prefer the code.
 
 ## 2.0.0 — unreleased
 
@@ -65,15 +132,17 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
 - **All identifiers are ObjectId strings, not integers.** `orderId`, IP address ids, auth ids and
   `paymentId` are 24-char hex strings. Code that casts them to `int`, compares them numerically or
   stores them in an integer column breaks. The one exception: resident **list** ids stay numeric
-  (`Long`) — `residentListRename`, `residentListRotation`, `residentListDelete`,
+  (64-bit integers) — `residentListRename`, `residentListRotation`, `residentListDelete`,
   `proxyDownloadResident($id)`.
 - **Errors throw `ProxySeller\Userapi\ApiException`** instead of a plain `\Exception`.
   `getCode()` is now the business error code from the envelope; the transport status moved to
   `getHttpStatus()`. The full `errors` array, the `data` payload and the raw body are available
   through `getErrors()`, `getData()`, `getResponseBody()`.
 - **`setPaymentId()` no longer defaults to `1`** (v1's inner balance) and `balanceAdd()` no longer
-  defaults to `29`. Payment systems must be taken from `balancePaymentsList()`; there are no
-  hardcoded numeric payment ids in v2.
+  defaults to `29`; there are no hardcoded numeric payment ids in v2. Orders and renewals are paid
+  with `balance` or `paddle_subscription` (the saved card) — set the code with `setPaymentCode()`
+  or pass `'paymentCode' => 'balance'` per call. `balancePaymentsList()` lists only the systems
+  for topping up with `balanceAdd()`; the balance itself is never in it.
 - **`balanceAdd()` accepts only `paymentId`.** If just a `paymentCode` is configured, the call now
   throws `\InvalidArgumentException` instead of silently sending `paymentId: null` and coming back
   with `Set existed [paymentId]`. `paymentCode` is resolved on order/prolong endpoints only.
@@ -98,7 +167,7 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
   Without `customTargetName` the SDK throws locally rather than letting the server answer
   `Incorrect goal` (code 14). A `mix` order is considered resolved — and therefore goal-free — when
   `mixId`/`mixCode` is present, or `countryId` carries a `packageId:quantity` pair, or `countryId`
-  is set together with `quantity > 0` (mirrors `ClientApiService.parseMixSelection`).
+  is set together with `quantity > 0` — the same three ways the server recognises a MIX package.
 
 ### Added
 
@@ -118,6 +187,8 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
 - Auth management: `authAdd()`, `authAddIp()`, `authChange()`, `authDelete()`.
 - Renewals: `prolongCalc()`, `prolongMake()` with an options array
   (`orderSeparatorIds`, `orderSeparatorId`, `periodCode`, `paymentCode`).
+  *(`orderSeparatorIds` / `orderSeparatorId` were dropped again in 2.0.1 — passing them now throws,
+  use `orderIds` — see above.)*
 - Proxy: `proxyReplace()`, `proxyDownloadResident()`.
 - Resident: `residentConsumption()`, `residentTrafficDetails()`, `residentGeoIsp()`,
   `residentGeoCount()`, `residentListAdd()`, `residentListRotation()`, `residentListTools()`.
@@ -150,8 +221,9 @@ compatible extension of it. This release targets v2 only; 1.x remains the client
 - Endpoints whose `data` arrives as a string (`resident/list/delete`, `residentsubuser/delete`,
   `residentsubuser/list/delete`) are normalized to an array, so `['status' => 'not-found']` inside a
   successful envelope is no longer indistinguishable from a successful delete on PHP 8.
-- Request bodies that would serialize to `[]` (no filters passed) are sent as `{}` — Spring answers
-  a bare plain-text HTTP 400 for a JSON array where it expects an object.
+- Request bodies that would serialize to `[]` (no filters passed) are sent as `{}` — the server
+  treats a JSON array where it expects an object as a malformed body and answers HTTP 200 with
+  `Incorrect request body` (code 0, sometimes followed by `: <field>`) in the usual envelope.
 - `authChange()` omits credentials that were not provided, so changing only `active` no longer sends
   empty `login`/`password`/`ip`.
 
