@@ -1652,7 +1652,16 @@ class Api {
      * List of proxies
      * @param string $type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | null
      * @param array $filters latest | orderId | country | ends | page | per_page.
-     *                       orderId — ObjectId-СТРОКА (не число), country — код страны
+     *                       latest = 'Y' — только прокси последнего заказа среди тех, что вернул бы
+     *                       запрос: с типом — последнего заказа этого типа (mix / mix_isp —
+     *                       последнего MIX), без типа — один последний заказ на весь ответ.
+     *                       «Последний» — по покупке, продление не в счёт. С orderId
+     *                       игнорируется, на resident и scraper не действует.
+     *                       orderId — любой идентификатор заказа из ответов API: order_id
+     *                       (proxyList / orderList), числовой id строки orderList (id строки
+     *                       продления — её заказ) или номер: текущий order_number,
+     *                       base_order_number либо прежний номер продлённого заказа (_e_<hash>).
+     *                       country — код страны
      * @return array
      */
     function proxyList($type = null, $filters = []) {

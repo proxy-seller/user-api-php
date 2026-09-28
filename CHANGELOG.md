@@ -82,6 +82,13 @@ Catching up with server changes made after 2.0.
   `\InvalidArgumentException`); `'rateLimit' => false`, short for `['enabled' => false]`, restores
   the previous behaviour exactly, and `true` means all defaults. The queue lives in the instance: separate instances and processes do not
   coordinate, and under php-fpm every web request starts with a new, empty queue.
+- **`proxyList()` filters follow the server.** `latest = 'Y'` now means the latest order of the
+  requested type (of the MIX orders for `mix` / `mix_isp`) instead of the latest order of the whole
+  account, which left the list empty whenever another type had been bought last; without a type it
+  is still one latest order for the whole response, and it no longer empties `resident` and
+  `scraper`. `orderId` also accepts the numeric `id` of an `orderList()` row, `base_order_number`
+  and an earlier `order_number` of a renewed order, not only `order_id` and the exact current
+  `order_number`. No SDK code changed — both values go to the server as they are.
 - **`prolongMake()` returns `orderIds`** — every renewed order, since one request can renew several.
   `orderId` stays and equals `orderIds[0]`; `listBaseOrderNumbers` carries one base order number per
   renewed order (per package for `mix` / `mix_isp`).
