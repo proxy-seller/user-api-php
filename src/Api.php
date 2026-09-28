@@ -58,8 +58,8 @@ class Api {
      * Типы, которые продаются и продлеваются только ЦЕЛЫМ ЗАКАЗОМ. В prolong/* и autoprolong/*
      * их выбирают через orderIds — order_id из proxy/list или order/list: сервер продлевает все
      * активные прокси этого типа в названных заказах (у mix/mix_isp — mix-пакеты этих заказов),
-     * а ipIds/ips для них отклоняет ошибкой "[ipIds] is not applicable for <type>: prolong by
-     * [orderIds]". Остальные типы (ipv4, isp, mobile) продлеваются по отдельным прокси — ipIds/ips.
+     * а ids/ips для них отклоняет ошибкой "[ids] is not applicable for <type>: prolong by
+     * [orderIds]". Остальные типы (ipv4, isp, mobile) продлеваются по отдельным прокси — ids/ips.
      */
     const ORDER_PROLONG_TYPES = ['ipv6', 'mix', 'mix_isp'];
 
@@ -69,7 +69,6 @@ class Api {
      * задумал вызывающий. Присланные в options отбиваем по имени, с подсказкой замены.
      */
     const PROLONG_REMOVED_FIELDS = [
-        'ids' => '`ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp)',
         'orderSeparatorIds' => '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`',
         'orderSeparatorId' => '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`',
     ];
@@ -1228,7 +1227,7 @@ class Api {
      *
      *  - ipv4 / isp / mobile продлеваются по отдельным прокси. Адрес уходит в ips ровно в том
      *    виде, в каком его показывает proxy/list: ipv4/isp — поле "ip", mobile —
-     *    "ip:port_http:port_socks"; id прокси (поле "id" из proxy/list) — в ipIds. Оба поля
+     *    "ip:port_http:port_socks"; id прокси (поле "id" из proxy/list) — в ids. Оба поля
      *    сразу не отправляются: смесь отбивает prepareProlong (см. assertSelectionNotMixed).
      *  - ipv6 / mix / mix_isp продлеваются только целым заказом: id заказа (order_id из
      *    proxy/list или order/list) уходит в orderIds. Адрес для этих типов тоже уходит в ips —
@@ -1240,10 +1239,10 @@ class Api {
      *
      * @param string $type тип из пути
      * @param array|string $ipsOrIds
-     * @return array непустые из ips и ipIds (ipv4/isp/mobile) либо orderIds (ipv6/mix/mix_isp)
+     * @return array непустые из ips и ids (ipv4/isp/mobile) либо orderIds (ipv6/mix/mix_isp)
      */
     protected function splitProlongTargets($type, $ipsOrIds) {
-        $idField = $this->isOrderProlongType($type) ? 'orderIds' : 'ipIds';
+        $idField = $this->isOrderProlongType($type) ? 'orderIds' : 'ids';
         $targets = ['ips' => [], $idField => []];
         foreach ($this->prolongSelectionValues($ipsOrIds) as $value) {
             if (strpos($value, '.') !== false || strpos($value, ':') !== false) {
@@ -1276,11 +1275,11 @@ class Api {
     /**
      * Тело prolong/* — и основа тела autoprolong/*.
      *
-     * Выбор собирается из $ids по типу, см. splitProlongTargets. ipIds / ips / orderIds можно
+     * Выбор собирается из $ids по типу, см. splitProlongTargets. ids / ips / orderIds можно
      * задать и явно через options: явное значение заменяет выведенное из $ids для того же поля.
      * Пустые поля выбора не отправляются.
      *
-     * ids, orderSeparatorIds и orderSeparatorId из контракта удалены, и сервер их не читает.
+     * orderSeparatorIds и orderSeparatorId из контракта удалены, и сервер их не читает.
      * Молча выбрасывать их нельзя, поэтому присланные в options отбиваем по имени, с подсказкой
      * замены (PROLONG_REMOVED_FIELDS). Смесь id прокси и адресов у ipv4 / isp / mobile тоже
      * отбиваем — см. assertSelectionNotMixed.
@@ -1306,10 +1305,10 @@ class Api {
             $this->splitProlongTargets($type, $ids)
         );
         $allowed = [
-            'ipIds', 'ips', 'orderIds', 'periodId', 'periodCode', 'coupon', 'paymentId', 'paymentCode'
+            'ids', 'ips', 'orderIds', 'periodId', 'periodCode', 'coupon', 'paymentId', 'paymentCode'
         ];
         $options = array_intersect_key($options, array_flip($allowed));
-        foreach (['ipIds', 'ips', 'orderIds'] as $field) {
+        foreach (['ids', 'ips', 'orderIds'] as $field) {
             if (!array_key_exists($field, $options)) {
                 continue;
             }
@@ -1333,8 +1332,8 @@ class Api {
     }
 
     /**
-     * ipv4 / isp / mobile: ipIds и ips в одном запросе не отправляем. Получив оба поля, сервер
-     * берёт ipIds и не читает ips вовсе, так что адреса молча выпали бы из ПЛАТНОГО продления.
+     * ipv4 / isp / mobile: ids и ips в одном запросе не отправляем. Получив оба поля, сервер
+     * продлевает по ids и игнорирует ips, так что адреса молча выпали бы из ПЛАТНОГО продления.
      * Поэтому смесь id прокси и адресов — в одном списке $ids, между списком и options или между
      * полями options — отбиваем локально, до запроса.
      *
@@ -1346,12 +1345,12 @@ class Api {
      * @throws \InvalidArgumentException
      */
     protected function assertSelectionNotMixed($type, $request) {
-        if ($this->isOrderProlongType($type) || !isset($request['ipIds'], $request['ips'])) {
+        if ($this->isOrderProlongType($type) || !isset($request['ids'], $request['ips'])) {
             return;
         }
         throw new \InvalidArgumentException(
             'Mixing proxy ids and addresses in one call is not supported: pass either ids or addresses'
-            . ' (given both ipIds and ips the server reads ipIds and ignores ips, so the addresses'
+            . ' (given both ids and ips the server renews by ids and ignores ips, so the addresses'
             . ' would silently drop out of the renewal)'
         );
     }
@@ -1365,19 +1364,20 @@ class Api {
      *  - ipv6, mix, mix_isp — order ids ("order_id" from proxy/list or order/list). These types
      *    are renewed only as whole orders: every active proxy of the type in those orders is
      *    covered (for mix/mix_isp — the mix packages of those orders).
-     * Values with a dot or a colon are sent as ips, the rest as ipIds (ipv4/isp/mobile) or as
+     * Values with a dot or a colon are sent as ips, the rest as ids (ipv4/isp/mobile) or as
      * orderIds (ipv6/mix/mix_isp). For ipv4/isp/mobile pass EITHER ids OR addresses in one call:
-     * given both ipIds and ips the server reads only ipIds, so a mix is refused locally. The
-     * server rejects a selection field of the wrong kind, e.g. "[ips] is not applicable for ipv6:
-     * prolong by [orderIds]", and an order that is not yours or has no active proxies of the type
+     * given both ids and ips the server renews by ids and ignores ips, so a mix is refused
+     * locally. The server rejects a selection field of the wrong kind (code 0), e.g. "[ips] is not
+     * applicable for ipv6: prolong by [orderIds]" or "[orderIds] is not applicable for ipv4:
+     * prolong by [ids]", and an order that is not yours or has no active proxies of the type
      * fails the whole request with "Incorrect orderIds" (code 29).
      *
      * @param string $type - ipv4 | isp | mobile | ipv6 | mix | mix_isp
      * @param array|string $ids addresses or proxy ids (ipv4, isp, mobile); order ids (ipv6, mix, mix_isp)
      * @param string $periodId period code from reference/list, e.g. "1m"
      * @param string $coupon
-     * @param array $options periodCode, paymentId/paymentCode, coupon; ipIds/ips/orderIds to pass
-     *                       the selection explicitly. The removed ids / orderSeparatorIds /
+     * @param array $options periodCode, paymentId/paymentCode, coupon; ids/ips/orderIds to pass
+     *                       the selection explicitly. The removed orderSeparatorIds /
      *                       orderSeparatorId are refused by name (see PROLONG_REMOVED_FIELDS)
      * @return array
      * @throws \InvalidArgumentException on ids mixed with addresses for ipv4/isp/mobile, or on a
@@ -1425,7 +1425,7 @@ class Api {
     /**
      * Тело autoprolong/* — это тело prolong/* плюс subscriptionId и tarifId. Поэтому собираем
      * его тем же prepareProlong: выбор прокси и заказов у ручного и авто-продления общий
-     * (ipIds / ips для ipv4, isp, mobile; orderIds для ipv6, mix, mix_isp), и сервер разбирает
+     * (ids / ips для ipv4, isp, mobile; orderIds для ipv6, mix, mix_isp), и сервер разбирает
      * оба тела по одним правилам.
      *
      * Купона тут нет СОЗНАТЕЛЬНО, хотя поле унаследовано и в prolong/calc работает: автопродление
@@ -1459,11 +1459,11 @@ class Api {
     }
 
     /**
-     * Резидентка автопродлевается ПАКЕТОМ: адресов и заказов у неё нет, и непустые ipIds / ips /
-     * orderIds сервер отклоняет ("[ipIds] is not applicable for resident: auto-prolong applies to
-     * the whole package"). Молча снимать выбор нельзя — disable, задуманный для пары адресов,
+     * Резидентка автопродлевается ПАКЕТОМ: адресов и заказов у неё нет, и любое из непустых ids /
+     * ips / orderIds сервер отклоняет ("[ids] is not applicable for resident: auto-prolong applies
+     * to the whole package"). Молча снимать выбор нельзя — disable, задуманный для пары адресов,
      * выключил бы автопродление всего пакета. Поэтому любой непустой выбор — список $ids или
-     * поле в options, включая удалённые ids / orderSeparatorIds / orderSeparatorId, — отбиваем
+     * поле в options, включая удалённые orderSeparatorIds / orderSeparatorId, — отбиваем
      * локально. Пустой список выбором не считается: autoProlongCalc('resident', []) законен.
      *
      * @param array|string $ids
@@ -1475,7 +1475,7 @@ class Api {
         if ($this->prolongSelectionValues($ids)) {
             $passed[] = '$ids';
         }
-        $fields = array_merge(['ipIds', 'ips', 'orderIds'], array_keys(self::PROLONG_REMOVED_FIELDS));
+        $fields = array_merge(['ids', 'ips', 'orderIds'], array_keys(self::PROLONG_REMOVED_FIELDS));
         foreach ($fields as $field) {
             if (array_key_exists($field, $options) && $this->prolongSelectionValues($options[$field])) {
                 $passed[] = $field;
@@ -1575,7 +1575,7 @@ class Api {
      *                   единица правки там пакет, и любой выбор отбивается локально
      * @param string $periodId period code from reference/list, e.g. "1m"; для resident не нужен
      * @param array $options subscriptionId, tarifId, paymentId/paymentCode, periodCode,
-     *                       ipIds/ips/orderIds для явного выбора
+     *                       ids/ips/orderIds для явного выбора
      * @return array
      * @throws \InvalidArgumentException при type=scraper, без платёжки, при смеси id и адресов
      *                                   (ipv4/isp/mobile), при удалённом поле в options и при
@@ -1591,11 +1591,11 @@ class Api {
     /**
      * Включить автопродление. Сейчас НИЧЕГО не списывает, только вооружает будущее списание.
      *
-     * data: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate, dateEnd.
-     * quantity/ipIds — это РЕАЛЬНО затронутые прокси (поле id из proxy/list), а не эхо запроса,
+     * data: warning, autoProlong, quantity, ids[], orderIds[], days, paymentId, chargeDate, dateEnd.
+     * quantity/ids — это РЕАЛЬНО затронутые прокси (поле id из proxy/list), а не эхо запроса,
      * orderIds — их заказы без повторов: ipv6/mix/mix_isp включаются целым заказом, поэтому
      * затронуты все активные прокси названных заказов. У type=resident приходит quantity=1 и
-     * пустые ipIds/orderIds — единица правки там пакет; тело тогда пакетное (paymentId,
+     * пустые ids/orderIds — единица правки там пакет; тело тогда пакетное (paymentId,
      * необязательно tarifId).
      *
      * Заменяет удалённый resident/autorenew/enable.
@@ -1605,7 +1605,7 @@ class Api {
      *                   id заказов (order_id) для ipv6/mix/mix_isp; для resident — пустой список
      * @param string $periodId period code from reference/list, e.g. "1m"; для resident не нужен
      * @param array $options subscriptionId, tarifId, paymentId/paymentCode, periodCode,
-     *                       ipIds/ips/orderIds для явного выбора
+     *                       ids/ips/orderIds для явного выбора
      * @return array
      * @throws \InvalidArgumentException как autoProlongCalc() — запрос не уходит
      */
@@ -1620,9 +1620,9 @@ class Api {
      * Выключить автопродление и сбросить привязанные период с платёжкой — следующий enable
      * придётся звать с ними снова. Прокси никуда не деваются, просто перестают продлеваться сами.
      *
-     * data: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate,
+     * data: warning, autoProlong, quantity, ids[], orderIds[], days, paymentId, chargeDate,
      * dateEnd, где paymentId/chargeDate всегда null, days — null у обычных прокси (у resident это
-     * период тарифа), а dateEnd показывает, до какого числа всё ещё оплачено. ipIds/orderIds —
+     * период тарифа), а dateEnd показывает, до какого числа всё ещё оплачено. ids/orderIds —
      * РЕАЛЬНО затронутые прокси и их заказы, как в autoProlongEnable().
      * Ни период, ни платёжка здесь не нужны. У type=resident выборки нет вовсе: выключение
      * адресуется пакетом вызывающего аккаунта, и выбор, переданный для resident, отбивается
@@ -1633,7 +1633,7 @@ class Api {
      * @param string $type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
      * @param array|string $ids как в prolongCalc(): адреса ЛИБО id прокси для ipv4/isp/mobile,
      *                   id заказов (order_id) для ipv6/mix/mix_isp; для resident — пустой список
-     * @param array $options ipIds/ips/orderIds для явного выбора и прочее, что понимает prepareProlong
+     * @param array $options ids/ips/orderIds для явного выбора и прочее, что понимает prepareProlong
      * @return array
      * @throws \InvalidArgumentException при type=scraper, при смеси id и адресов (ipv4/isp/mobile),
      *                                   при удалённом поле в options и при выборе у resident

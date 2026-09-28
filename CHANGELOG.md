@@ -8,36 +8,39 @@ Catching up with server changes made after 2.0.
 
 ### Breaking
 
-- **Renewals are addressed by type.** `prolongCalc()`, `prolongMake()` and
-  `autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()` now send `ipIds` (the proxy
-  `id`) or `ips` (the address) for `ipv4`, `isp` and `mobile`, and `orderIds` (`order_id` from
-  `proxyList()` or `orderList()`) for `ipv6`, `mix` and `mix_isp` — the server renews those three
-  only as whole orders, every active proxy of the type in them (the mix packages for `mix` /
-  `mix_isp`). Values are still routed by shape: an address goes to `ips`, anything else to `ipIds`
-  or `orderIds` depending on the type, which is normalized the way the server does it (`MIX-ISP`
-  counts as `mix_isp`). Code that renewed `ipv6`, `mix` or `mix_isp` by address (`host:port` /
-  `ip`) or by proxy id must pass order ids now: the server refuses the old selection with
-  `[ips] is not applicable for ipv6: prolong by [orderIds]` (or `[ipIds] …`), and an order that is
-  not yours or has no active proxies of that type fails the whole request with
+- **`ipv6`, `mix` and `mix_isp` are renewed by order.** `prolongCalc()`, `prolongMake()` and
+  `autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()` send `orderIds` (`order_id`
+  from `proxyList()` or `orderList()`) instead of `ids` for these three types — the server renews
+  them only as whole orders, every active proxy of the type in them (the mix packages for `mix` /
+  `mix_isp`). `ipv4`, `isp` and `mobile` are renewed per proxy as before, by `ids` (the proxy `id`
+  from `proxyList()`) or by `ips` (the address — `ip` for `ipv4` / `isp`,
+  `ip:port_http:port_socks` for `mobile`). Values are still routed by shape: an address goes to
+  `ips`, anything else to `ids` or `orderIds` depending on the type, which is normalized the way
+  the server does it (`MIX-ISP` counts as `mix_isp`). Code that renewed `ipv6`, `mix` or `mix_isp`
+  by address (`host:port` / `ip`) or by proxy id must pass order ids now. The server refuses a
+  selection field of the wrong kind with code 0 —
+  `[ids] is not applicable for ipv6: prolong by [orderIds]` (`[ips] …` for addresses) and, the
+  other way round, `[orderIds] is not applicable for ipv4: prolong by [ids]` — and an order that
+  is not yours or has no active proxies of that type fails the whole request with
   `Incorrect orderIds` (code 29).
-- **`ids`, `orderSeparatorIds` and `orderSeparatorId` are gone from the renewal body.** The server
-  no longer reads them. The SDK no longer sends `ids`, and passing any of the three in the options
-  array throws `\InvalidArgumentException` naming the replacement instead of being dropped
-  silently: `` `ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp) ``,
+- **`orderSeparatorIds` and `orderSeparatorId` are gone from the renewal body.** The server no
+  longer reads them. Passing either in the options array throws `\InvalidArgumentException` naming
+  the replacement instead of being dropped silently:
   `` `orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds` ``.
 - **Proxy ids and addresses cannot be mixed in one call for `ipv4`, `isp` and `mobile`.** Given both
-  `ipIds` and `ips`, the server reads `ipIds` and ignores `ips`, so the addresses would silently drop
-  out of a paid renewal. The SDK throws `\InvalidArgumentException` ("Mixing proxy ids and addresses
-  in one call is not supported: pass either ids or addresses") instead of sending both — for a mixed
-  list as well as for a list combined with the options array. `ipv6` / `mix` / `mix_isp` still
-  route a mixed list (ids → `orderIds`, addresses → `ips`) and leave the address part to the server.
+  `ids` and `ips`, the server renews by `ids` and ignores `ips`, so the addresses would silently
+  drop out of a paid renewal. The SDK throws `\InvalidArgumentException` ("Mixing proxy ids and
+  addresses in one call is not supported: pass either ids or addresses") instead of sending both —
+  for a mixed list as well as for a list combined with the options array. `ipv6` / `mix` /
+  `mix_isp` still route a mixed list (ids → `orderIds`, addresses → `ips`) and leave the address
+  part to the server.
 - **Residential auto-renewal refuses a selection.** With `type = 'resident'` a non-empty `$ids` list,
-  `ipIds`, `ips` or `orderIds` throws `\InvalidArgumentException` ("resident auto-prolong applies to
-  the whole package: do not pass proxy or order ids") instead of being stripped silently: a
-  `disable` meant for a few addresses would otherwise switch off the whole package. An empty list is
-  fine, and the period is still dropped.
-- **`autoprolong/enable` and `autoprolong/disable` answer `ipIds` instead of `ids`** — the proxies
-  actually affected — plus a new `orderIds` with their orders. Both are empty for `resident`.
+  or a non-empty `ids`, `ips` or `orderIds` in the options array, throws
+  `\InvalidArgumentException` ("resident auto-prolong applies to the whole package: do not pass
+  proxy or order ids") instead of being stripped silently: a `disable` meant for a few addresses
+  would otherwise switch off the whole package. The server refuses each of the three as well, with
+  `[ids] is not applicable for resident: auto-prolong applies to the whole package`. An empty list
+  is fine, and the period is still dropped.
 
 ### Added
 
@@ -50,6 +53,8 @@ Catching up with server changes made after 2.0.
   `autoprolong/{calc,enable,disable}/{type}`. `paymentId` is mandatory on calc and enable and is
   restricted to `balance` / `paddle_subscription`; `type = 'resident'` sends the package-shaped
   body (`paymentId`, optional `tarifId`) and takes no selection — passing one throws (see Breaking).
+  `enable` and `disable` answer `ids` — the proxies actually affected, the `id` of `proxyList()` —
+  and `orderIds` with their orders; both lists are empty for `resident`.
 - **Optional `X-Fingerprint` on `order/make`.** Configure it as `['fingerprint' => ...]`, with
   `setFingerprint()`, or per call via `$options['fingerprint']`; the SDK sends it whenever a value
   is set and never requires it. Orders placed with an API key are created without it in every
@@ -101,9 +106,9 @@ Catching up with server changes made after 2.0.
   segment, the `200`-with-an-error envelope and the access triple, every local gate
   (`customTargetName`, `balanceAdd`), `X-Fingerprint` sent when set but never required, the split
   `*Id` / `*Code` precedence, `generateAuth` on `order/make` only, the removed auto top-up caps,
-  download routing, `not-found` deletes, type-aware renewal routing (`ips` / `ipIds` /
+  download routing, `not-found` deletes, type-aware renewal routing (`ids` / `ips` /
   `orderIds`, no empty lists), the local refusal of ids mixed with addresses and of the removed
-  `ids` / `orderSeparatorIds` / `orderSeparatorId`, auto-renewal with the residential selection
+  `orderSeparatorIds` / `orderSeparatorId`, auto-renewal with the residential selection
   refused, and the snake_case filter names of `order/list`.
 - **Request-queue tests** (`tests/RateLimitTest.php`) run on an injected fake clock and sleeper, so
   they take no real time: payment and write spacing, the later-of-both wait of a payment after a

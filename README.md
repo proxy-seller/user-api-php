@@ -201,10 +201,14 @@ Any opaque string is accepted — the server does not validate its shape — but
 
 ## Renewing proxies
 
-What a renewal is addressed by depends on the type. `ipv4`, `isp` and `mobile` are renewed per
-proxy — by the address `proxyList()` shows or by the proxy's `id`. **`ipv6`, `mix` and `mix_isp`
-are renewed as whole orders by `orderIds`** — pass the `order_id` of each order, and every active
-proxy of that type in it is renewed (for `mix` / `mix_isp`: the mix packages of those orders).
+What a renewal is addressed by depends on the type:
+
+- **`ipv4`, `isp` and `mobile` are renewed per proxy**: by `ids` (the proxy `id` from
+  `proxyList()`) or by `ips` (the address — `ip` for `ipv4` / `isp`, `ip:port_http:port_socks`
+  for `mobile`).
+- **`ipv6`, `mix` and `mix_isp` are renewed as whole orders, by `orderIds` only** — pass the
+  `order_id` of each order (from `proxyList()` or `orderList()`), and every active proxy of that
+  type in it is renewed (for `mix` / `mix_isp`: the mix packages of those orders).
 
 ```php
 // ipv4 / isp / mobile — per proxy, by address (or by the proxy id)
@@ -229,27 +233,28 @@ What to pass per type, and which `proxyList()` field it comes from:
 
 | Type | Pass this | Built from | Sent as |
 | --- | --- | --- | --- |
-| `ipv4`, `isp` | the plain address, `"1.2.3.4"` — or the proxy id | `ip` — or `id` | `ips` — or `ipIds` |
-| `mobile` | `"ip:port_http:port_socks"`, e.g. `"1.2.3.4:50100:50101"` — or the proxy id | `ip`, `port_http`, `port_socks` — or `id` | `ips` — or `ipIds` |
+| `ipv4`, `isp` | the plain address, `"1.2.3.4"` — or the proxy id | `ip` — or `id` | `ips` — or `ids` |
+| `mobile` | `"ip:port_http:port_socks"`, e.g. `"1.2.3.4:50100:50101"` — or the proxy id | `ip`, `port_http`, `port_socks` — or `id` | `ips` — or `ids` |
 | `ipv6`, `mix`, `mix_isp` | the order id | `order_id` (the same value as in `orderList()`) | `orderIds` |
 
 The SDK routes each value by its shape: a value with a dot or a colon is an address and goes to
-`ips`, anything else is an id and goes to `ipIds` for `ipv4` / `isp` / `mobile` and to `orderIds` for
-`ipv6` / `mix` / `mix_isp`. To set a field yourself, pass `ipIds`, `ips` or `orderIds` in the final
+`ips`, anything else is an id and goes to `ids` for `ipv4` / `isp` / `mobile` and to `orderIds` for
+`ipv6` / `mix` / `mix_isp`. To set a field yourself, pass `ids`, `ips` or `orderIds` in the final
 options array; empty lists are never sent.
 
 **For `ipv4`, `isp` and `mobile` pass either ids or addresses in one call, not both.** Given both
-`ipIds` and `ips`, the server reads `ipIds` and ignores `ips`, so the addresses would silently drop
+`ids` and `ips`, the server renews by `ids` and ignores `ips`, so the addresses would silently drop
 out of a paid renewal. The SDK therefore throws `\InvalidArgumentException` — "Mixing proxy ids and
 addresses in one call is not supported: pass either ids or addresses" — before anything is sent,
 whether the mix sits in one list or is split between the list and the options array. Renew ids and
 addresses in two calls. For `ipv6`, `mix` and `mix_isp` a mixed list is still routed (ids to
 `orderIds`, addresses to `ips`), and the server rejects the address part itself.
 
-The server refuses a selection of the wrong kind instead of guessing. An address or a proxy id for
-`ipv6` / `mix` / `mix_isp` fails with `[ips] is not applicable for ipv6: prolong by [orderIds]` (or
-`[ipIds] …`); an order id for `ipv4` / `isp` / `mobile` fails with
-`[orderIds] is not applicable for ipv4: prolong by [ipIds]`. An order that is not yours or has no
+The server refuses a selection field of the wrong kind instead of guessing, with code 0: `ids` or
+`ips` for `ipv6` / `mix` / `mix_isp` fails with
+`[ids] is not applicable for ipv6: prolong by [orderIds]` (`[ips] …` for addresses), and
+`orderIds` for `ipv4` / `isp` / `mobile` fails with
+`[orderIds] is not applicable for ipv4: prolong by [ids]`. An order that is not yours or has no
 active proxies of that type — or an empty list — fails the whole request with `Incorrect orderIds`
 (code 29), and nothing is renewed. `quantity` and `items` in the `prolongCalc()` answer show what a
 renewal actually covers.
@@ -262,17 +267,16 @@ for `mix` / `mix_isp`).
 `prolongMake()` throws `ApiException` when the balance is short — the renewal did not happen.
 Check the price with `prolongCalc()` first if you want to handle that gracefully.
 
-> **`ids`, `orderSeparatorIds` and `orderSeparatorId` are gone** from the renewal body — the server
-> no longer reads them. Passing one in the options array throws `\InvalidArgumentException` that
-> names the replacement instead of dropping it silently: `ids` → `ipIds` (ipv4/isp/mobile) or
-> `orderIds` (ipv6/mix/mix_isp); `orderSeparatorIds` / `orderSeparatorId` → `orderIds`. The list is
+> **`orderSeparatorIds` and `orderSeparatorId` are gone** from the renewal body — the server no
+> longer reads them. Passing either in the options array throws `\InvalidArgumentException` that
+> names the replacement, `orderIds`, instead of dropping it silently. The list is
 > `Api::PROLONG_REMOVED_FIELDS`.
 
 ## Automatic renewal
 
 `prolongMake()` charges you now. `autoprolong/*` only arms a charge that happens later, without you present — a separate branch of the API, not a flag on prolong.
 
-The selection works exactly as in [Renewing proxies](#renewing-proxies): addresses or proxy ids for `ipv4`, `isp` and `mobile` (one kind per call — a mix throws), order ids for `ipv6`, `mix` and `mix_isp`, and the removed `ids` / `orderSeparatorIds` / `orderSeparatorId` are refused by name.
+The selection works exactly as in [Renewing proxies](#renewing-proxies): `ids` (proxy ids) or `ips` (addresses) for `ipv4`, `isp` and `mobile` (one kind per call — a mix throws), `orderIds` (order ids) for `ipv6`, `mix` and `mix_isp`, and the removed `orderSeparatorIds` / `orderSeparatorId` are refused by name.
 
 ```php
 $api->autoProlongCalc('ipv4', ['1.2.3.4'], '1m', ['paymentId' => 'balance']);
@@ -294,11 +298,11 @@ $api->autoProlongEnable('resident', [], null, ['paymentId' => 'balance', 'tarifI
 $api->autoProlongDisable('resident');
 ```
 
-**For `resident` pass no selection at all.** A non-empty `$ids` list, `ipIds`, `ips` or `orderIds` throws `\InvalidArgumentException` — "resident auto-prolong applies to the whole package: do not pass proxy or order ids" — before anything is sent. The SDK deliberately does not strip the selection: a `disable` meant for a few addresses would otherwise switch off auto-renewal for the whole package. (The server refuses such a body as well, with `[ipIds] is not applicable for resident: auto-prolong applies to the whole package`.) An empty list is fine, and a period is neither needed nor sent.
+**For `resident` pass no selection at all.** A non-empty `$ids` list, or a non-empty `ids`, `ips` or `orderIds` in the options array, throws `\InvalidArgumentException` — "resident auto-prolong applies to the whole package: do not pass proxy or order ids" — before anything is sent. The SDK deliberately does not strip the selection: a `disable` meant for a few addresses would otherwise switch off auto-renewal for the whole package. (The server refuses such a body as well: any of `ids`, `ips` and `orderIds` fails with `[ids] is not applicable for resident: auto-prolong applies to the whole package`.) An empty list is fine, and a period is neither needed nor sent.
 
 Three things about the answers before you parse them:
 
-* **`ipIds` and `orderIds` are not an echo.** `enable` and `disable` report the proxies actually affected in `ipIds` (the `id` of `proxyList()`) and their orders in `orderIds`. For `ipv6`, `mix` and `mix_isp` the whole order is switched at once, so `quantity` and `ipIds` cover every active proxy of the orders you sent. For `resident` both lists are empty and `quantity` is `1`. The proxy list used to be called `ids`.
+* **`ids` and `orderIds` are not an echo.** `enable` and `disable` report the proxies actually affected in `ids` (the `id` of `proxyList()`) and their orders in `orderIds`. For `ipv6`, `mix` and `mix_isp` the whole order is switched at once, so `quantity` and `ids` cover every active proxy of the orders you sent. For `resident` both lists are empty and `quantity` is `1`.
 * **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled* `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
 * **Residential fills different fields.** `chargeDate` is null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead, and `days` is the tariff's own period.
 
@@ -522,7 +526,7 @@ Every assertion follows the behaviour of the v2 API server, not of this README: 
 - auto top-up: the caps removed from the contract on 2026-08-18 are rejected **by name**, partial updates send only what was passed, and `false` / `0` are not mistaken for "unset";
 - download routing — a custom `ext` with a slash is legal on `/proxy/download/{type}` but not on the literal `/proxy/download/resident`, which also ignores `package_key`;
 - `data: null` inside a `status: "success"` delete being reported as `not-found` rather than as a successful deletion;
-- renewal routing by type and shape: addresses into `ips`, proxy ids into `ipIds` for ipv4/isp/mobile, order ids into `orderIds` for ipv6/mix/mix_isp (whatever the spelling of the type), no empty lists; ids mixed with addresses refused locally for ipv4/isp/mobile, and the removed `ids` / `orderSeparatorIds` / `orderSeparatorId` refused by name, all before the request;
+- renewal routing by type and shape: addresses into `ips`, proxy ids into `ids` for ipv4/isp/mobile, order ids into `orderIds` for ipv6/mix/mix_isp (whatever the spelling of the type), no empty lists; ids mixed with addresses refused locally for ipv4/isp/mobile, and the removed `orderSeparatorIds` / `orderSeparatorId` refused by name, all before the request;
 - auto-renewal: `scraper` refused locally, `paymentId` required for calc and enable but not for disable, the package-shaped residential body, and any residential selection refused rather than stripped;
 - the request queue, on a fake clock so no test waits: payments 2 s and writes 1 s apart counted from the previous start, a payment after a write waiting for the later of the two, reads never held by the lane, the sliding window shared by all kinds of requests, HTTP 429 retried after `Retry-After` (2 s by default, 60 s at most, HTTP dates too) and given up after `maxRetries` with status 429, code 57 and the access triple never retried, the disabled mode and the `false` / `true` shorthand, a second write on a busy instance refused, and every SDK method paced by the endpoint it calls.
 
