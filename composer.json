@@ -1,25 +1,11 @@
 {
     "name": "proxy-seller/user-api-php",
-    "description": "PHP SDK for the Proxy-Seller Client API v2: orders, proxy lists and exports, balance and auto top-up, resident packages, subpackages and lists.",
+    "description": "Interaction with user api",
     "type": "library",
-    "keywords": [
-        "proxy",
-        "proxy-seller",
-        "client-api",
-        "residential-proxy",
-        "sdk"
-    ],
     "homepage": "https://github.com/proxy-seller/user-api-php",
-    "support": {
-        "issues": "https://github.com/proxy-seller/user-api-php/issues",
-        "docs": "https://docs.proxy-seller.com/"
-    },
     "require": {
         "php": "^7.2.5 || ^8.0",
         "guzzlehttp/guzzle": "^7.0"
-    },
-    "require-dev": {
-        "phpunit/phpunit": "^9.6 || ^10.5 || ^11.0"
     },
     "license": "MIT",
     "autoload": {
@@ -27,21 +13,9 @@
             "ProxySeller\\Userapi\\": "src/"
         }
     },
-    "autoload-dev": {
-        "psr-4": {
-            "ProxySeller\\Userapi\\Tests\\": "tests/"
-        }
-    },
-    "scripts": {
-        "test": "phpunit"
-    },
     "authors": [
         {
-            "name": "proxy-seller",
-            "homepage": "https://proxy-seller.com/"
+            "name": "proxy-seller"
         }
-    ],
-    "config": {
-        "sort-packages": true
-    }
+    ]
 }
