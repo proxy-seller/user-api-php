@@ -32,12 +32,18 @@ use ProxySeller\Userapi\ApiException;
 $api = new Api([
     'key' => 'YOUR_API_KEY',
     'fingerprint' => 'my-installation-id',   // optional X-Fingerprint for order/make, see below
-    'timeout' => 15,
+    'timeout' => 30,          // seconds, every call except payments (the default)
+    'moneyTimeout' => 120,    // seconds, order/make, prolong/make, balance/add (the default)
     'connect_timeout' => 5,
 ]);
 
 echo $api->balance();
 ```
+
+Do not cut the payment timeout short: a large order can take the server well over 30 seconds, and
+a call that times out may still have created and paid for the order. Payment calls always wait at
+least `moneyTimeout`, whatever `timeout` says — see
+[Timeouts and retries on payments](#timeouts-and-retries-on-payments).
 
 Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by default.
 It also paces its own requests to stay under the API's limits; see
@@ -53,6 +59,14 @@ $api->setPaymentCode('balance');     // or 'paddle_subscription' to pay with the
 // per call, in the final options array:
 $api->orderMakeIpv4('USA', '1m', 1, null, null, 'my target', ['paymentCode' => 'balance']);
 ```
+
+`setPaymentCode()` and `setPaymentId()` only set the **client default**. A payment named in the call
+itself — `paymentId` or `paymentCode` in the options array, or the `$paymentId` argument of
+`balanceAdd()` — wins, and then the client's pair is not sent at all, neither the id nor the code.
+So `setPaymentCode('paddle_subscription')` followed by a call with `['paymentId' => 'balance']`
+pays from the balance, not with the card. Within one level the old rule stands: given both a code
+and an id in the same call, the code wins. An empty value (`null`, `''`) in the call counts as not
+given.
 
 `balancePaymentsList()` is **not** where order payments come from. It lists the systems for
 topping up the balance with `balanceAdd()`, never contains the balance itself, and none of its
@@ -71,6 +85,14 @@ $api = new Api(['key' => 'YOUR_API_KEY', 'baseUrl' => 'http://localhost:7995/per
 `baseUrl` must include `/personal/api/v2/`. You may also inject an already configured
 Guzzle-compatible client through the `client` option — useful for a custom transport, tracing,
 TLS settings or local stubs.
+
+On payments and writes the SDK adds two request options to whatever client is used: `curl` with
+`CURLOPT_FRESH_CONNECT => true`, and on payments `timeout` (see
+[Timeouts and retries on payments](#timeouts-and-retries-on-payments)). For a Guzzle client the SDK
+reads its `curl` and `timeout` defaults through `getConfig()` and merges with them — your cURL
+options stay in place, and your timeout is only ever raised, never lowered; a Guzzle client without
+a timeout keeps waiting without a limit. A custom transport without `getConfig()` receives the
+options as they are, and should merge a request-level `curl` array with its own defaults.
 </details>
 
 ## IDs in v2 are strings, not numbers
@@ -326,6 +348,26 @@ try {
 }
 ```
 
+The same `ApiException` covers what is not a business error:
+
+- **No answer at all** — a timeout, a refused or dropped connection, a DNS failure. `getHttpStatus()`
+  is `0`, `getErrors()` is empty, and the message names the Guzzle exception class and the cURL
+  error, e.g. `Transport error (ConnectException): cURL error 28: Operation timed out after 120001
+  milliseconds …`. Guzzle exceptions do not escape the SDK, and the raw one is not chained as
+  `getPrevious()`: its request carries the URL with your key.
+- **An answer without the envelope** — HTML from a load balancer or the front, a framework error
+  page. `getHttpStatus()` is the real status, and the message and `getResponseBody()` carry the
+  first 500 bytes of the body.
+- **A payment or a write that did not report success** — see
+  [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
+
+**The API key never shows up in an error.** It is a segment of the URL path, and cURL messages and
+some error pages repeat that path — the front even lower-cases it. The SDK replaces the key with
+`***` everywhere in an `ApiException` (message, `getResponseBody()`, `getErrors()`, `getData()`),
+ignoring case and in its URL-encoded forms too, and `var_dump($api)` / `print_r($api)` show the base
+URL masked. The Guzzle client returned by `getClient()` is untouched: its `base_uri` still holds the
+key, so do not dump it into logs.
+
 ### Access errors are a fixed triple — read the whole array
 
 A bad API key, a caller IP outside the key's allowlist and an exceeded request limit (1000 requests per calendar minute per key) all come back as **HTTP 200** with the same three-element `errors` array:
@@ -367,7 +409,7 @@ try {
 }
 ```
 
-Calculation/prolong responses with `status=error`, useful `data`, and an empty `errors` array are returned as warning data instead of causing a parser failure. Inspect `$api->getLastResponseStatus()` if this distinction matters.
+Calculation responses (`order/calc`, `prolong/calc`, `autoprolong/calc`) with `status=error`, useful `data`, and an empty `errors` array are returned as warning data instead of causing a parser failure. Inspect `$api->getLastResponseStatus()` if this distinction matters. Payments and writes are strict: for them only `status: "success"` is a success, and the same shape throws `ApiException` — see [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
 
 ## Rate limits and the request queue
 
@@ -396,8 +438,13 @@ nothing to set up:
   the last attempt.
 - **Nothing else is retried.** Code 57, `Prolong for this order is already in progress`, reaches you
   as it is — repeating a renewal automatically could renew the order twice. So does the access-error
-  triple, which may just as well mean a wrong key or IP. Transport errors (timeouts, refused
-  connections) are not retried either.
+  triple, which may just as well mean a wrong key or IP. Transport errors (timeouts, refused or
+  dropped connections) are not retried either — not by the SDK and, for payments and writes, not by
+  the transport: those always go out on a fresh connection (`CURLOPT_FRESH_CONNECT`). On a reused
+  keep-alive connection libcurl silently sends a request again when the connection dies before any
+  answer arrives, and the server may already have executed it — before 2.0.1 a single
+  `orderMake()` could create two orders that way and report success. Reads still reuse
+  connections, so libcurl may re-send one of them, which is harmless.
 
 What goes where — by the endpoint a method calls, not by its HTTP method:
 
@@ -446,6 +493,62 @@ first is still in flight, the second is not sent: it throws `\LogicException`.
 For tests, `rateLimit` also accepts `clock` — a callable returning the current time in milliseconds
 (monotonic) — and `sleeper`, a callable that receives the milliseconds to wait. Together they let a
 test run the queue on fake time.
+
+## Timeouts and retries on payments
+
+`order/make` (every `orderMake*()`), `prolong/make` (`prolongMake()`) and `balance/add`
+(`balanceAdd()`) move money. They get their own timeout, `moneyTimeout` — **120 seconds** by
+default — because the server builds some orders synchronously: a large MIX order takes about a second
+per country. Every other call keeps `timeout`, 30 seconds by default. A payment waits for the longer
+of the two, so a short `timeout` never cuts it off; `0` in either means no limit, as in Guzzle.
+
+```php
+$api = new Api(['key' => 'YOUR_API_KEY', 'moneyTimeout' => 180]);   // seconds
+```
+
+**A timeout, a dropped connection or a 5xx on a payment means the outcome is unknown.** The request
+may have reached the server, and the order may have been created and paid for — or the balance
+topped up — although no answer came back. The SDK never repeats such a call itself (its only
+automatic retry is HTTP 429 from the edge, which means the request never reached the API), and
+neither does the transport (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)).
+Do not repeat it blindly either — check first:
+
+| Call | Check before repeating |
+| --- | --- |
+| `orderMake*()` | `orderList(['sort_by' => 'date_insert', 'order' => 'desc', 'limit' => 10])` — is the order there? |
+| `prolongMake()` | `proxyList()` — have the end dates moved? — or `orderList(['is_extend' => 'Y'])` |
+| `balanceAdd()` | `balance()`; an unpaid payment link charges nothing, so asking for a new one is safe |
+
+What reaches you is always an `ApiException`, and when the outcome is unknown its message says so —
+"the request may have been executed — check before retrying":
+
+- `getHttpStatus() === 0` — no answer at all: a timeout, a refused or dropped connection;
+- `getHttpStatus() >= 500` — an error page from a gateway in front of the API;
+- `Unexpected response (no JSON envelope) …` — a 2xx without the envelope: an HTML maintenance
+  page, an empty body, a `204`, broken JSON;
+- `Unexpected response: status "error" without errors …` — an envelope that reports neither success
+  nor a reason. For a payment or a write only `status: "success"` counts as success.
+
+```php
+try {
+    $order = $api->orderMakeIpv4('USA', '1m', 1, null, null, 'my target');
+} catch (ApiException $e) {
+    if (!$e->getErrors() && $e->getHttpStatus() !== 429) {
+        // no verdict from the API: the order may exist — look it up with orderList() before retrying
+    }
+    throw $e;
+}
+```
+
+A business error — `getErrors()` is not empty, e.g. insufficient funds — and a 429 left after all
+retries are answers from the API or its edge: the call was refused. Writes (`auth*()`,
+`proxyReplace()`, `autoProlongEnable()` and the rest of the write row above) follow the same strict
+rules; an unknown outcome there costs no money, but re-read the state before repeating.
+
+Under php-fpm the web server has limits of its own: nginx's `fastcgi_read_timeout` (60 seconds by
+default) or php-fpm's `request_terminate_timeout` can end the PHP request before a 120-second
+payment returns — the order then completes on the server while your script never learns about it.
+Place orders from a CLI worker or a queue job, or raise those limits.
 
 ## Balance and auto top-up
 
@@ -513,7 +616,7 @@ composer install
 composer test          # or: vendor/bin/phpunit
 ```
 
-The suite is **offline**: `Api` accepts an injected HTTP client through the `client` config key, so the tests drive the SDK with canned envelopes and inspect the request it built. They answer "does the SDK assemble and parse correctly", not "is the server up" — nothing is mocked away that the SDK itself is responsible for.
+The suite is **offline**: `Api` accepts an injected HTTP client through the `client` config key, so the tests drive the SDK with canned envelopes and inspect the request it built. They answer "does the SDK assemble and parse correctly", not "is the server up" — nothing is mocked away that the SDK itself is responsible for. Two transport tests are the exception that proves it: the re-send they guard against is libcurl's own, so they start a small HTTP server on `127.0.0.1` in a separate PHP process (`tests/Support/drop_after_body_server.php`, via `proc_open`) and are skipped without the curl extension.
 
 Every assertion follows the behaviour of the v2 API server, not of this README: docs can drift from the server without anyone noticing, a test cannot. What is covered:
 
@@ -528,6 +631,11 @@ Every assertion follows the behaviour of the v2 API server, not of this README: 
 - `data: null` inside a `status: "success"` delete being reported as `not-found` rather than as a successful deletion;
 - renewal routing by type and shape: addresses into `ips`, proxy ids into `ids` for ipv4/isp/mobile, order ids into `orderIds` for ipv6/mix/mix_isp (whatever the spelling of the type), no empty lists; ids mixed with addresses refused locally for ipv4/isp/mobile, and the removed `orderSeparatorIds` / `orderSeparatorId` refused by name, all before the request;
 - auto-renewal: `scraper` refused locally, `paymentId` required for calc and enable but not for disable, the package-shaped residential body, and any residential selection refused rather than stripped;
-- the request queue, on a fake clock so no test waits: payments 2 s and writes 1 s apart counted from the previous start, a payment after a write waiting for the later of the two, reads never held by the lane, the sliding window shared by all kinds of requests, HTTP 429 retried after `Retry-After` (2 s by default, 60 s at most, HTTP dates too) and given up after `maxRetries` with status 429, code 57 and the access triple never retried, the disabled mode and the `false` / `true` shorthand, a second write on a busy instance refused, and every SDK method paced by the endpoint it calls.
+- the request queue, on a fake clock so no test waits: payments 2 s and writes 1 s apart counted from the previous start, a payment after a write waiting for the later of the two, reads never held by the lane, the sliding window shared by all kinds of requests, HTTP 429 retried after `Retry-After` (2 s by default, 60 s at most, HTTP dates too) and given up after `maxRetries` with status 429, code 57 and the access triple never retried, the disabled mode and the `false` / `true` shorthand, a second write on a busy instance refused, and every SDK method paced by the endpoint it calls;
+- no re-send on a dropped connection, on a real socket: the local server reads a payment or a write on a warmed-up keep-alive connection and closes it without answering — the request must arrive exactly once and end in `ApiException`, while a control test shows bare Guzzle sending it twice; `CURLOPT_FRESH_CONNECT` on payments and writes only, merged with the cURL options of the config or of an injected Guzzle client;
+- transport errors as `ApiException` with HTTP status 0 and no Guzzle exception chained, and the key masked everywhere an error can be printed — message, string form, body, `errors`, `data`, the SDK frames of the trace — for cURL messages, a Spring 500 echoing the path, the front's lower-cased HTML 404 and URL-encoded keys; bodies cut to 500 bytes after masking; `var_dump()` / `print_r()` of the client;
+- strict success for payments and writes — a 2xx without the envelope (HTML, empty, 204, a list, broken JSON) and `status: "error"` without errors throw — while `*/calc` still returns its warning data and reads, downloads and deletes parse as before;
+- the payment named in a call outranking `setPaymentId()` / `setPaymentCode()` in every order, renewal and auto-renewal call and in `balanceAdd()`;
+- timeouts: payments wait `max(timeout, moneyTimeout)` (120 s by default), everything else `timeout`, `0` means no limit, an injected client's timeout is only raised, and `moneyTimeout` is validated.
 
 To exercise a locally running API server, point the local `baseUrl` shown above at it (port 7995 in that example), use a development API key and call read-only endpoints first (`balance`, `authList`, `residentList`).

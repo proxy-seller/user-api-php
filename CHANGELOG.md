@@ -4,7 +4,10 @@ All notable changes to this package. This project follows [Semantic Versioning](
 
 ## 2.0.1 — unreleased
 
-Catching up with server changes made after 2.0.
+Catching up with server changes made after 2.0, and safety fixes made before v2 is published: a
+payment no longer goes out twice on a dropped connection, the API key no longer reaches error texts,
+the payment named in a call wins over the client's, payments get their own 120-second timeout, and
+payments and writes succeed only on `status: "success"`.
 
 ### Breaking
 
@@ -41,6 +44,41 @@ Catching up with server changes made after 2.0.
   would otherwise switch off the whole package. The server refuses each of the three as well, with
   `[ids] is not applicable for resident: auto-prolong applies to the whole package`. An empty list
   is fine, and the period is still dropped.
+- **Guzzle exceptions no longer escape the SDK.** A transport failure — timeout, refused or dropped
+  connection, DNS — throws `ApiException` with `getHttpStatus() === 0` (or the status of a response
+  that did arrive), an empty `getErrors()` and a message naming the Guzzle exception class and the
+  cURL error, e.g. `Transport error (ConnectException): cURL error 28: …`. The Guzzle exception is
+  not chained as `getPrevious()`: its request and handler context carry the URL with the API key.
+  Code that caught `GuzzleHttp\Exception\GuzzleException` / `ConnectException` around SDK calls
+  must catch `ApiException`. Guzzle's `InvalidArgumentException` for bad request options becomes a
+  plain `\InvalidArgumentException` (nothing was sent).
+- **Payments and writes accept only a `status: "success"` envelope.** For `order/make`,
+  `prolong/make`, `balance/add` and every write endpoint (`auth/*`, `proxy/replace`,
+  `proxy/comment/set`, `autoprolong/enable|disable`, `balance/autotopup/set`, resident lists and
+  subpackages) a 2xx answer without the envelope — HTML, an empty body, `204`, a JSON list or
+  string, broken JSON — used to be returned as the result (a string where the order was expected),
+  and `status: "error"` with `data` and an empty `errors[]` was returned as `data`. Both now throw
+  `ApiException`: `Unexpected response (no JSON envelope); the request may have been executed —
+  check before retrying (HTTP …)` and `Unexpected response: status "error" without errors; …`
+  (the `data` stays in `getData()`). `order/calc`, `prolong/calc` and `autoprolong/calc` still
+  return their warning data for that shape, and reads and downloads are parsed as before. Deletes
+  keep reporting `['status' => 'not-found']` from a successful envelope.
+
+### Security
+
+- **The API key is masked in every error.** It is a path segment, and it reached exception texts
+  through Guzzle's `… for <URL>` suffix and through error pages that echo the path — a Spring 500
+  puts it in `path`, the front answers an unknown path with a 20 KB HTML page that repeats it in
+  lower case. The SDK now replaces the key with `***` in the message, `getResponseBody()`,
+  `getErrors()` and `getData()` of every `ApiException` — ignoring case, and in its URL-encoded and
+  JSON-escaped forms too — and keeps it out of the arguments of the SDK frames of the trace.
+  `var_dump()` / `print_r()` of an `Api` show the base URL masked and the transport by class name
+  (`__debugInfo()`). The client from `getClient()` is unchanged and still holds the key in
+  `base_uri`.
+- **Bodies of answers without the envelope are cut to 500 bytes** (after masking, on a UTF-8
+  character boundary) in the message and in `getResponseBody()`; the message is now
+  `Client API returned HTTP <status>: <body>` instead of the bare body. For payments and writes a
+  5xx adds `the request may have been executed — check before retrying`.
 
 ### Added
 
@@ -69,6 +107,14 @@ Catching up with server changes made after 2.0.
 - **`Api::ORDER_PROLONG_TYPES`** — the types renewed as whole orders by `orderIds` (`ipv6`, `mix`,
   `mix_isp`) — and **`Api::PROLONG_REMOVED_FIELDS`**, the removed selection fields with the message
   that names their replacement.
+- **`moneyTimeout` config key** — the timeout of `order/make`, `prolong/make` and `balance/add` in
+  seconds, **120 by default**; every other call keeps `timeout` (30 by default). A payment waits
+  `max(timeout, moneyTimeout)`, so a short general timeout no longer cuts off a large order the
+  server is still building (about a second per country for MIX); `0` in either means no limit, as
+  in Guzzle. With an injected Guzzle client its own `timeout` is read through `getConfig()` and only
+  ever raised; a client without a timeout keeps waiting without a limit. An invalid value throws
+  `\InvalidArgumentException` when the client is created. Also `Api::DEFAULT_TIMEOUT`,
+  `Api::DEFAULT_MONEY_TIMEOUT` and `Api::ERROR_BODY_LIMIT`.
 
 ### Changed
 
@@ -128,6 +174,17 @@ Catching up with server changes made after 2.0.
   seconds or as an HTTP date, the 2 s default, the 60 s cap, giving up with status 429), code 57
   and the access triple not retried, the disabled mode and the `false` / `true` shorthand, a second
   write refused while one is in flight, and the category of every SDK method.
+- **Transport tests** (`tests/TransportTest.php`). Two of them run on a real socket:
+  `tests/Support/drop_after_body_server.php`, started as a separate PHP process on `127.0.0.1`,
+  keeps connections alive and drops a payment or a write after reading it — the request must arrive
+  exactly once and end in `ApiException`, and a control test shows bare Guzzle sending it twice on
+  a reused connection. The rest drive Guzzle's `MockHandler`: `CURLOPT_FRESH_CONNECT` merged with the
+  user's cURL options, transport errors without the key and without `previous` (a closed port as
+  well), the payment timeout and its validation, injected clients' timeouts.
+- **Guard tests** for the payment named in a call outranking the client's (every order, renewal and
+  auto-renewal call, `balanceAdd()`), strict success of payments and writes next to the lenient
+  `*/calc`, and the key masked in errors built from responses (Spring 500, the lower-cased HTML 404
+  of the front, URL-encoded keys, truncation after masking, `var_dump()` of the client).
 
 ### Fixed
 
@@ -135,6 +192,37 @@ Catching up with server changes made after 2.0.
   `tarifId`. The server applies the code on those four only while the id is empty, so a caller who
   filled both halves silently got the wrong package, operator, rotation or tariff. `countryCode`,
   `periodCode` and `paymentCode` keep priority — there the server does prefer the code.
+- **A payment or a write is never sent twice by the transport.** On a reused keep-alive connection
+  libcurl silently re-sends a request whose connection dies before any answer ("Connection died,
+  retrying a fresh connect"), although the server may already have read and executed it: one
+  `orderMake()` could create two orders and return success. Payments and writes now go out on a
+  fresh connection (`'curl' => [CURLOPT_FRESH_CONNECT => true]`, merged with the cURL options of the
+  config or of an injected Guzzle client instead of replacing them — Guzzle merges request options
+  shallowly), so a drop reaches the caller as `ApiException`. Reads still reuse connections.
+- **The payment named in a call wins over the client's.** `setPaymentId()` / `setPaymentCode()` are
+  client defaults; a `paymentId` or `paymentCode` in the options of `order/calc`, `order/make`
+  (every helper), `prolong/calc`, `prolong/make` and `autoprolong/calc|enable` now replaces the
+  client's pair entirely. Before, the client's pair was merged underneath and the "code beats id"
+  rule let a client-level `paymentCode` remove the call's `paymentId`:
+  `setPaymentCode('paddle_subscription')` plus `['paymentId' => 'balance']` paid with the card.
+  Within one level the code still wins. An empty `$paymentId` in `balanceAdd()` now counts as not
+  given and falls back to the client's id.
+- **`getLastResponseStatus()` describes the last call only**: it is reset when a request starts, so
+  after a transport error or an answer without the envelope it is `null` instead of the status of
+  an earlier call.
+
+### Documentation
+
+- **"Timeouts and retries on payments"** in the README: a timeout, a dropped connection or a 5xx on
+  `order/make`, `prolong/make` or `balance/add` means the outcome is unknown — the order may have
+  been created and paid for; check `orderList()` (`proxyList()` / `orderList()` for a renewal,
+  `balance()` for a top-up) before repeating. The SDK repeats none of them itself, except HTTP 429
+  from the edge, which never reached the API. The section lists the `ApiException` shapes of an
+  unknown outcome and the php-fpm / nginx limits that can end a request before 120 seconds.
+- The README promise "transport errors are not retried" was not true for libcurl's own re-send; it
+  now explains the fresh connection. The configuration example no longer sets `'timeout' => 15`.
+- `setPaymentId()` / `setPaymentCode()` are documented as client defaults that a call's payment
+  overrides; the README describes the options the SDK adds to an injected client's requests.
 
 ## 2.0.0 — unreleased
 

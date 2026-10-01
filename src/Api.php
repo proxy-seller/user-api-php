@@ -20,6 +20,11 @@ namespace ProxySeller\Userapi;
  *    умолчанию: общее скользящее окно 1000 стартов за 60 с, write/money — по одному и не чаще
  *    раза в 1 с (money — раза в 2 с), HTTP 429 от edge повторяется по Retry-After. Тройку доступа
  *    и прочие ошибки конверта SDK НЕ повторяет. Очередь своя у каждого экземпляра.
+ *  - write/money не повторяет и транспорт: они уходят по СВЕЖЕМУ соединению, иначе libcurl сам
+ *    переотправлял бы запрос, у которого keep-alive соединение умерло до ответа (см.
+ *    withTransportOptions). Успех у них — только конверт со status = "success". Таймаут денежных
+ *    вызовов свой — 'moneyTimeout' (120 с), у остальных — 'timeout' (30 с).
+ *  - Ключ стоит в пути URL, поэтому в текстах ошибок SDK заменяет его на *** (см. redact()).
  *  - proxy/download/*, resident/geo и resident/geo/isp отдают ФАЙЛ (attachment), а не конверт.
  *  - order/make принимает НЕОБЯЗАТЕЛЬНЫЙ заголовок X-Fingerprint: он нужен для анти-фрода и
  *    affiliate-атрибуции, но без него сервер не отказывает ни одной секции. SDK шлёт его, когда
@@ -73,8 +78,38 @@ class Api {
         'orderSeparatorId' => '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`',
     ];
 
+    /** Таймаут запроса по умолчанию, с (ключ Guzzle 'timeout'): всё, кроме денежных вызовов. */
+    const DEFAULT_TIMEOUT = 30;
+
+    /**
+     * Таймаут денежного вызова по умолчанию, с (ключ конфига 'moneyTimeout'): order/make,
+     * prolong/make/{type}, balance/add. Большой MIX-заказ сервер собирает синхронно, около секунды
+     * на страну, — 30 с общего таймаута на нём кончались раньше, чем заказ, и оплаченный заказ
+     * выглядел у клиента ошибкой.
+     */
+    const DEFAULT_MONEY_TIMEOUT = 120;
+
+    /** Сколько байт тела ответа без конверта попадает в текст ApiException и в getResponseBody(). */
+    const ERROR_BODY_LIMIT = 500;
+
     protected $client;
     protected $requestBaseUri;
+
+    /** @var string[] варианты написания ключа, которые redact() заменяет на *** */
+    protected $secrets = [];
+
+    /**
+     * @var int|float|null общий таймаут транспорта, с: 0 — без предела, null — неизвестен
+     *                     (свой транспорт без getConfig())
+     */
+    protected $clientTimeout = null;
+
+    /** @var array curl-опции клиента по умолчанию — с ними сливается CURLOPT_FRESH_CONNECT */
+    protected $clientCurl = [];
+
+    /** @var int|float таймаут денежных вызовов, с (0 — без предела) */
+    protected $moneyTimeout = self::DEFAULT_MONEY_TIMEOUT;
+
     protected $paymentId = null;
     protected $paymentCode = null;
     protected $generateAuth = 'N';
@@ -87,13 +122,14 @@ class Api {
     /**
      * Key placed in https://proxy-seller.com/personal/api/
      * Кроме key понимает baseUrl/base_url, client (свой транспорт), fingerprint (значение
-     * необязательного заголовка X-Fingerprint для order/make, см. setFingerprint) и rateLimit
+     * необязательного заголовка X-Fingerprint для order/make, см. setFingerprint), rateLimit
      * (очередь запросов: enabled, requestsPerMinute, writeIntervalMs, moneyIntervalMs, maxRetries,
      * для тестов clock/sleeper — см. RateLimiter; false — сокращение ['enabled' => false], true —
-     * все значения по умолчанию); остальное уходит в Guzzle.
+     * все значения по умолчанию) и moneyTimeout (таймаут денежных вызовов в секундах, по умолчанию
+     * 120, 0 — без предела; см. moneyRequestTimeout); остальное уходит в Guzzle.
      * @param array $config
      * @throws \Exception
-     * @throws \InvalidArgumentException при негодном rateLimit
+     * @throws \InvalidArgumentException при негодном rateLimit или moneyTimeout
      */
     public function __construct($config = []) {
         $key = isset($config['key']) ? $config['key'] : null;
@@ -106,29 +142,131 @@ class Api {
         $injectedClient = isset($config['client']) ? $config['client'] : null;
         $fingerprint = isset($config['fingerprint']) ? $config['fingerprint'] : null;
         $rateLimit = isset($config['rateLimit']) ? $config['rateLimit'] : null;
+        $moneyTimeout = isset($config['moneyTimeout']) ? $config['moneyTimeout'] : null;
         unset($config['key'], $config['baseUrl'], $config['base_url'], $config['client'], $config['fingerprint'],
-            $config['rateLimit']);
+            $config['rateLimit'], $config['moneyTimeout']);
 
         $this->requestBaseUri = rtrim($baseUrl, '/') . '/' . rawurlencode($key) . '/';
+        $this->secrets = self::secretVariants($key);
         $this->setFingerprint($fingerprint);
         $this->rateLimiter = new RateLimiter($rateLimit);
+        $this->moneyTimeout = self::moneyTimeoutOption($moneyTimeout);
 
         if ($injectedClient !== null) {
             if (!is_object($injectedClient) || !method_exists($injectedClient, 'request')) {
                 throw new \InvalidArgumentException('client must provide a request() method');
             }
             $this->client = $injectedClient;
+            $this->readClientDefaults($injectedClient);
             return;
         }
 
         if (!isset($config['timeout'])) {
-            $config['timeout'] = 30;
+            $config['timeout'] = self::DEFAULT_TIMEOUT;
         }
         if (!isset($config['connect_timeout'])) {
             $config['connect_timeout'] = 10;
         }
+        $this->clientTimeout = is_numeric($config['timeout']) ? $config['timeout'] + 0 : null;
+        $this->clientCurl = isset($config['curl']) && is_array($config['curl']) ? $config['curl'] : [];
         $config['base_uri'] = $this->requestBaseUri;
         $this->client = new \GuzzleHttp\Client($config);
+    }
+
+    /**
+     * Таймаут и curl-опции инжектированного клиента. Он настроен вызывающим, и ломать эти
+     * настройки нельзя: денежный таймаут его таймаут только поднимает, а CURLOPT_FRESH_CONNECT
+     * сливается с его curl-опциями. Guzzle мержит опции запроса с опциями клиента НЕГЛУБОКО, и
+     * запросный 'curl' без слияния молча выкинул бы клиентские (прокси, TLS, DNS).
+     *
+     * Видно это только у клиента с getConfig() — у Guzzle он есть. Свой транспорт без него:
+     * таймаут неизвестен (считаем его умолчанием SDK), curl-опций не знаем.
+     *
+     * @param object $client
+     * @return void
+     */
+    protected function readClientDefaults($client) {
+        if (!method_exists($client, 'getConfig')) {
+            return;
+        }
+        try {
+            $timeout = $client->getConfig('timeout');
+            $curl = $client->getConfig('curl');
+        } catch (\Throwable $e) {
+            return;
+        }
+        // Таймаут не задан — у Guzzle это «без предела».
+        $this->clientTimeout = $timeout === null ? 0 : (is_numeric($timeout) ? $timeout + 0 : null);
+        $this->clientCurl = is_array($curl) ? $curl : [];
+    }
+
+    /**
+     * moneyTimeout: секунды, 0 — без предела, null — значение по умолчанию.
+     * @param mixed $value
+     * @return int|float
+     * @throws \InvalidArgumentException
+     */
+    protected static function moneyTimeoutOption($value) {
+        if ($value === null) {
+            return self::DEFAULT_MONEY_TIMEOUT;
+        }
+        if (is_bool($value) || !is_numeric($value) || !is_finite((float) $value) || (float) $value < 0) {
+            throw new \InvalidArgumentException('moneyTimeout must be a number of seconds >= 0 (0 means no limit)');
+        }
+        return $value + 0;
+    }
+
+    /**
+     * Варианты написания ключа, которые прячет redact(): как есть, в URL-кодировке пути
+     * (rawurlencode — так он стоит в запросе) и формы (urlencode), и каждый — в JSON-экранировании
+     * ("a\/b"), как он выглядит внутри JSON-тела. Регистр redact() не различает. Длинные — первыми,
+     * чтобы короткий вариант не съел начало длинного.
+     *
+     * Строки короче 4 символов не берём: настоящий ключ такими не бывает (сервер выдаёт 12), а
+     * замена такой подстроки исказила бы любое сообщение.
+     *
+     * @param string $key
+     * @return string[]
+     */
+    protected static function secretVariants($key) {
+        $key = (string) $key;
+        $variants = [];
+        foreach ([$key, rawurlencode($key), urlencode($key)] as $form) {
+            $variants[] = $form;
+            $escaped = json_encode($form, JSON_UNESCAPED_UNICODE);
+            if (is_string($escaped)) {
+                $variants[] = substr($escaped, 1, -1);
+            }
+        }
+        $unique = [];
+        foreach ($variants as $variant) {
+            if (strlen($variant) >= 4) {
+                $unique[strtolower($variant)] = $variant;
+            }
+        }
+        $unique = array_values($unique);
+        usort($unique, function ($a, $b) {
+            return strlen($b) - strlen($a);
+        });
+        return $unique;
+    }
+
+    /**
+     * var_dump() и print_r() клиента — без ключа: он сидит в базовом URI и в конфиге
+     * Guzzle-клиента, а дамп объекта нередко уходит в лог целиком. Транспорт — только классом.
+     * @return array
+     */
+    public function __debugInfo() {
+        return [
+            'baseUri' => $this->redact($this->requestBaseUri),
+            'client' => is_object($this->client) ? get_class($this->client) : gettype($this->client),
+            'paymentId' => $this->paymentId,
+            'paymentCode' => $this->paymentCode,
+            'generateAuth' => $this->generateAuth,
+            'fingerprint' => $this->fingerprint,
+            'moneyTimeout' => $this->moneyTimeout,
+            'lastResponseStatus' => $this->lastResponseStatus,
+        ];
     }
 
     public function getClient() {
@@ -163,6 +301,10 @@ class Api {
      * сохранённой картой (paddle_subscription, нужна активная подписка карты): их ObjectId либо
      * код — сервер принимает здесь и код, тот же фолбэк, что для paymentCode. Системы из
      * balance/payments/list для заказов не годятся, а баланса в том списке нет вовсе.
+     *
+     * Это значение ПО УМОЛЧАНИЮ для клиента. Платёжка, названная в самом вызове (paymentId или
+     * paymentCode в options, $paymentId у balanceAdd), главнее: тогда пара клиента в запрос не
+     * попадает вовсе — ни id, ни code.
      * @param string $paymentId ObjectId, or a payment code on the order/prolong endpoints
      * @return void
      */
@@ -180,6 +322,7 @@ class Api {
      * paddle_subscription (сохранённая карта с активной подпиской). В balance/payments/list кодов
      * нет — оттуда приходят только id и name систем для пополнения баланса.
      * Резолвится только на order/calc, order/make, prolong/calc и prolong/make.
+     * Как и setPaymentId(), это значение по умолчанию: платёжка вызова главнее.
      * @param string $paymentCode
      * @return void
      */
@@ -229,11 +372,25 @@ class Api {
      * категорию она берёт из пути, ждёт окно и полосу записи и повторяет HTTP 429. Ответ, который
      * она вернула, разбирается как обычно — 429 после исчерпания повторов становится ApiException
      * с getHttpStatus() = 429.
+     *
+     * Категория пути решает и остальное:
+     *  - write/money уходят по свежему соединению, money — со своим таймаутом
+     *    (withTransportOptions);
+     *  - у write/money успех — ТОЛЬКО конверт со status = "success". status = "error" с data и
+     *    пустым errors[] — законная форма лишь у calc-ручек (а они — чтение), 2xx без конверта
+     *    (HTML, пустое тело, 204, не-объект, обрезанный JSON) у денег и записи — тоже ошибка: запрос
+     *    мог выполниться, и молча отдать вызывающему строку вместо данных заказа нельзя.
+     *    Чтение и выгрузки файлов разбираются как раньше.
+     *
+     * Ошибка транспорта становится ApiException с getHttpStatus() = 0. Ключ — он в пути — во всех
+     * текстах ошибки заменён на ***, сырое исключение Guzzle в previous не попадает.
+     *
      * @param string $method
      * @param string $uri
      * @param array $options
      * @return mixed
-     * @throws \Exception
+     * @throws ApiException
+     * @throws \InvalidArgumentException негодные опции запроса — запрос не ушёл
      */
     protected function request($method, $uri, $options = [], $returnStream = false) {
         if (!isset($options['http_errors'])) {
@@ -241,15 +398,31 @@ class Api {
         }
 
         $path = ltrim($uri, '/');
-        $url = $this->requestBaseUri . $path;
-        $client = $this->client;
-        $response = $this->rateLimiter->send($path, function () use ($client, $method, $url, $options) {
-            return $client->request($method, $url, $options);
-        });
+        $category = RateLimiter::classify($path);
+        $options = $this->withTransportOptions($category, $options);
+        // Статус прошлого ответа к этому запросу отношения не имеет.
+        $this->lastResponseStatus = null;
+        try {
+            // URL собираем внутри замыкания: его связанные переменные видны в трассе любого
+            // исключения, брошенного из очереди или транспорта, а в URL ключ.
+            $response = $this->rateLimiter->send($path, function () use ($method, $path, $options) {
+                return $this->client->request($method, $this->requestBaseUri . $path, $options);
+            });
+        } catch (\GuzzleHttp\Exception\GuzzleException | \Psr\Http\Client\ClientExceptionInterface $e) {
+            // Исключение собираем ЗДЕСЬ, а не в помощнике, которому отдано сырое: трасса снимается
+            // в момент new, и сырое исключение (его request и handlerContext хранят URI с ключом)
+            // попало бы в аргументы её кадра.
+            list($message, $status, $invalid) = $this->describeTransportError($e, $category);
+            if ($invalid) {
+                throw new \InvalidArgumentException($message);
+            }
+            throw new ApiException($message, 0, $status);
+        }
         $body = (string) $response->getBody();
         $httpStatus = (int) $response->getStatusCode();
         $httpOk = $httpStatus >= 200 && $httpStatus < 300;
         $json = \json_decode($body, true);
+        $strict = $category !== RateLimiter::READ;
 
         // Конверт client-api — это status в виде строки ("success"/"error"). У ответа с ошибкой
         // вне конверта (например от балансировщика перед сервером) тоже бывает ключ status, но
@@ -264,25 +437,48 @@ class Api {
             }
 
             // Calculation endpoints use status=error + data + an empty errors list
-            // for actionable warnings such as an insufficient balance.
+            // for actionable warnings such as an insufficient balance. Это чтение; у денег и
+            // записи такой ответ — не успех: причины нет, а заказ или правка могли состояться.
             if ($httpOk && !$errors && $data !== null) {
-                return $data;
+                if (!$strict) {
+                    return $data;
+                }
+                throw new ApiException(
+                    'Unexpected response: status "' . $this->redact($json['status']) . '" without errors;'
+                    . ' the request may have been executed — check before retrying',
+                    0, $httpStatus, [], $this->redactValue($data), $this->redact($body)
+                );
             }
 
-            $this->throwApiException($errors, $data, $httpStatus, $body);
+            $this->throwApiException($this->redactValue($errors), $this->redactValue($data), $httpStatus, $this->redact($body));
         }
 
         // Some validation handlers return a single ApiError rather than an envelope.
         if (is_array($json) && isset($json['message']) && isset($json['code'])) {
-            $this->throwApiException([$json], null, $httpStatus, $body);
+            $this->throwApiException($this->redactValue([$json]), null, $httpStatus, $this->redact($body));
         }
 
-        if ($httpStatus < 200 || $httpStatus >= 300) {
-            $message = $body !== '' ? $body : 'Client API returned HTTP ' . $httpStatus;
-            throw new ApiException($message, 0, $httpStatus, [], null, $body);
+        // Дальше ответ без конверта. Его тело — чаще всего HTML балансировщика или фронта — в
+        // ошибку идёт отредактированным и обрезанным: фронт отвечает на чужой путь страницей на
+        // 20 КБ, в которой этот путь, а с ним и ключ, повторён десятки раз.
+        if (!$httpOk) {
+            $excerpt = $this->excerpt($body);
+            $message = 'Client API returned HTTP ' . $httpStatus;
+            if ($strict && $httpStatus >= 500) {
+                $message .= '; the request may have been executed — check before retrying';
+            }
+            throw new ApiException($excerpt !== '' ? $message . ': ' . $excerpt : $message,
+                0, $httpStatus, [], null, $excerpt);
         }
 
-        $this->lastResponseStatus = null;
+        if ($strict) {
+            $excerpt = $this->excerpt($body);
+            $message = 'Unexpected response (no JSON envelope); the request may have been executed'
+                . ' — check before retrying (HTTP ' . $httpStatus . ')';
+            throw new ApiException($excerpt !== '' ? $message . ': ' . $excerpt : $message,
+                0, $httpStatus, [], null, $excerpt);
+        }
+
         if ($returnStream) {
             return \GuzzleHttp\Psr7\Utils::streamFor($body);
         }
@@ -290,10 +486,155 @@ class Api {
     }
 
     protected function throwApiException(array $errors, $data, $httpStatus, $body) {
+        // request() отдаёт сюда уже отредактированное — повтор ничего не меняет, но прикрывает
+        // прямые вызовы из наследников.
+        $errors = $this->redactValue($errors);
         $first = $errors ? reset($errors) : [];
         $message = isset($first['message']) ? $first['message'] : 'Client API error';
         $apiCode = isset($first['code']) ? $first['code'] : 0;
-        throw new ApiException($message, $apiCode, $httpStatus, $errors, $data, $body);
+        throw new ApiException($message, $apiCode, $httpStatus, $errors, $this->redactValue($data), $this->redact($body));
+    }
+
+    /**
+     * Опции транспорта по категории запроса. Чтение уходит как есть.
+     *
+     * write и money — по СВЕЖЕМУ соединению (CURLOPT_FRESH_CONNECT). На переиспользованном
+     * keep-alive соединении libcurl сам отправляет запрос ещё раз, если соединение умерло, не дав
+     * ни байта ответа («Connection died, retrying a fresh connect»), — а сервер к этому моменту мог
+     * запрос уже прочитать и выполнить: так один orderMake() давал два заказа и возвращал успех.
+     * На своём соединении такого повтора нет, обрыв доходит до вызывающего ошибкой. Чтение
+     * по-прежнему переиспользует соединения: его повтор безвреден.
+     *
+     * Опция сливается с curl-опциями клиента (см. readClientDefaults) и запроса, не затирая их.
+     * Без расширения curl (транспорт на потоках PHP) опции нет — и такого повтора тоже.
+     *
+     * money получает свой таймаут — moneyRequestTimeout(), если запрос не задал его сам.
+     *
+     * @param string $category money | write | read
+     * @param array $options
+     * @return array
+     */
+    protected function withTransportOptions($category, array $options) {
+        if ($category === RateLimiter::READ) {
+            return $options;
+        }
+        if (defined('CURLOPT_FRESH_CONNECT')) {
+            $curl = $this->clientCurl;
+            if (isset($options['curl']) && is_array($options['curl'])) {
+                // array_replace, а не array_merge: ключи — числовые константы CURLOPT_*, и
+                // array_merge перенумеровал бы их.
+                $curl = array_replace($curl, $options['curl']);
+            }
+            $curl[CURLOPT_FRESH_CONNECT] = true;
+            $options['curl'] = $curl;
+        }
+        if ($category === RateLimiter::MONEY && !isset($options['timeout'])) {
+            $options['timeout'] = $this->moneyRequestTimeout();
+        }
+        return $options;
+    }
+
+    /**
+     * Таймаут денежного запроса, с: большее из общего таймаута и moneyTimeout. Общий 15 с не
+     * укорачивает деньги, общий 300 с — не укорачивается до 120. Ноль у Guzzle — «без предела»,
+     * поэтому ноль у любого из двух даёт ноль: SDK таймаут только поднимает и не вводит предел
+     * там, где его не было. Общий таймаут своего транспорта без getConfig() неизвестен — считаем
+     * его умолчанием SDK (30 с).
+     *
+     * @return int|float
+     */
+    protected function moneyRequestTimeout() {
+        $general = $this->clientTimeout === null ? self::DEFAULT_TIMEOUT : $this->clientTimeout;
+        if ((float) $general === 0.0 || (float) $this->moneyTimeout === 0.0) {
+            return 0;
+        }
+        return max($general, $this->moneyTimeout);
+    }
+
+    /**
+     * Текст, HTTP-статус и род ошибки транспорта — обрыва, таймаута, отказа в соединении, DNS.
+     *
+     * Guzzle дописывает к тексту « for <URI>», а ключ в v2 стоит в пути, поэтому сырое
+     * исключение наружу не отдаём и в previous не цепляем. Переносим то, по чему ошибку
+     * различают: класс исключения и код cURL — в тексте (ключ заменён на ***), статус — если ответ
+     * всё-таки был, иначе 0. У write/money текст говорит прямо: исход неизвестен.
+     *
+     * \InvalidArgumentException (негодные опции запроса — запрос не ушёл) остаётся им.
+     *
+     * @param \Throwable $error
+     * @param string $category money | write | read
+     * @return array [string $message, int $httpStatus, bool $invalidArgument]
+     */
+    protected function describeTransportError($error, $category) {
+        $message = $this->redact($error->getMessage());
+        if ($error instanceof \InvalidArgumentException) {
+            return [$message, 0, true];
+        }
+        $class = get_class($error);
+        $pos = strrpos($class, '\\');
+        $text = 'Transport error (' . ($pos === false ? $class : substr($class, $pos + 1)) . '): ' . $message;
+        if ($category !== RateLimiter::READ) {
+            $text .= '; the request may have been executed — check before retrying';
+        }
+        $status = 0;
+        if (method_exists($error, 'getResponse')) {
+            $response = $error->getResponse();
+            if (is_object($response) && method_exists($response, 'getStatusCode')) {
+                $status = (int) $response->getStatusCode();
+            }
+        }
+        return [$text, $status, false];
+    }
+
+    /**
+     * Прячет API-ключ: он стоит в пути URL и вместе с ним попадает в тексты ошибок Guzzle/cURL и
+     * в эхо пути от сервера или фронта. Все варианты из secretVariants() заменяются на *** без
+     * учёта регистра: фронт отвечает на неизвестный путь HTML-страницей, где путь — а с ним и
+     * ключ — уже в нижнем регистре.
+     *
+     * @param string $text
+     * @return string
+     */
+    protected function redact($text) {
+        $text = (string) $text;
+        return $this->secrets ? str_ireplace($this->secrets, '***', $text) : $text;
+    }
+
+    /**
+     * redact() для строк внутри массива errors/data — на любой глубине; ключи не трогает.
+     * @param mixed $value
+     * @return mixed
+     */
+    protected function redactValue($value) {
+        if (is_string($value)) {
+            return $this->redact($value);
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                $value[$key] = $this->redactValue($item);
+            }
+        }
+        return $value;
+    }
+
+    /**
+     * Тело ответа без конверта для ошибки: ключ спрятан, длина — не больше ERROR_BODY_LIMIT байт.
+     * Сначала redact(), потом обрезка: иначе ключ, попавший на границу, остался бы наполовину.
+     *
+     * @param string $body
+     * @return string
+     */
+    protected function excerpt($body) {
+        $text = $this->redact($body);
+        if (strlen($text) <= self::ERROR_BODY_LIMIT) {
+            return $text;
+        }
+        // Режем по границе символа UTF-8: байт продолжения (10xxxxxx) символ не начинает.
+        $cut = self::ERROR_BODY_LIMIT;
+        while ($cut > 0 && (ord($text[$cut]) & 0xC0) === 0x80) {
+            $cut--;
+        }
+        return substr($text, 0, $cut) . '...';
     }
 
     protected function requestRaw($method, $uri, $options = [], $returnStream = false) {
@@ -554,12 +895,13 @@ class Api {
      *
      * @param float $summ минимальная сумма настраивается на сервере (по умолчанию 1);
      *                    сумма, равная минимуму, проходит
-     * @param string $paymentId ObjectId-строка из balance/payments/list
+     * @param string $paymentId ObjectId-строка из balance/payments/list; главнее setPaymentId(),
+     *                          пустая строка равна «не передан»
      * @return string Returns a link to the payment page
      * @throws \InvalidArgumentException если задан только paymentCode
      */
     function balanceAdd($summ = 5, $paymentId = null) {
-        if ($paymentId === null) {
+        if ($paymentId === null || trim((string) $paymentId) === '') {
             $paymentId = $this->getPaymentId();
         }
         if ($paymentId === null && $this->getPaymentCode() !== null) {
@@ -961,6 +1303,15 @@ class Api {
     }
 
     /**
+     * Названа ли в наборе полей своя платёжка — непустой paymentId или paymentCode (см. isFilled).
+     * @param array $fields
+     * @return boolean
+     */
+    protected function hasPayment($fields) {
+        return $this->isFilled($fields, 'paymentId') || $this->isFilled($fields, 'paymentCode');
+    }
+
+    /**
      * Мержит options в тело заказа и разводит пары *Id / *Code по правилам сервера.
      *
      * Как сервер разбирает id и коды:
@@ -991,6 +1342,15 @@ class Api {
             'rotationCode', 'tarifId', 'tarifCode', 'generateAuth'
         ];
         $options = array_intersect_key($this->normalizeOptions($options), array_flip($allowed));
+        // Платёжка вызова главнее платёжки клиента. Назвал вызов свою — paymentId или
+        // paymentCode, — пару клиента (setPaymentId / setPaymentCode) в тело не подмешиваем вовсе.
+        // Раньше она мержилась под options, и code клиента по правилу «code старше id» (ниже)
+        // снимал paymentId вызова: setPaymentCode('paddle_subscription') + ['paymentId' => 'balance']
+        // оплачивал заказ картой. Платёжка в $request на этот момент — только клиентская:
+        // позиционного аргумента у неё нет. Внутри одного уровня правило «code старше id» прежнее.
+        if ($this->hasPayment($options)) {
+            unset($request['paymentId'], $request['paymentCode']);
+        }
         $request = array_merge($request, $options);
 
         // Приоритет внутри пары у сервера НЕ единый:
@@ -1316,6 +1676,11 @@ class Api {
             if (!$options[$field]) {
                 unset($options[$field]);
             }
+        }
+        // Платёжка вызова главнее клиентской — как в applyOrderOptions: назвал вызов свою, пары
+        // клиента в теле нет вовсе. Это тело и у autoprolong/* (prepareAutoProlong).
+        if ($this->hasPayment($options)) {
+            unset($request['paymentId'], $request['paymentCode']);
         }
         $request = array_merge($request, $options);
         $this->assertSelectionNotMixed($type, $request);
