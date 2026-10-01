@@ -51,8 +51,13 @@ Catching up with server changes made after 2.0.
   `id` is a numeric order ID sent as a string next to the ObjectId `order_id`.
 - **`autoProlongCalc()` / `autoProlongEnable()` / `autoProlongDisable()`** for
   `autoprolong/{calc,enable,disable}/{type}`. `paymentId` is mandatory on calc and enable and is
-  restricted to `balance` / `paddle_subscription`; `type = 'resident'` sends the package-shaped
-  body (`paymentId`, optional `tarifId`) and takes no selection — passing one throws (see Breaking).
+  restricted to `balance` / `paddle_subscription`. `paddle_subscription` charges the card saved on
+  the account; `subscriptionId` is needed only when there are several saved cards (the server
+  answers `Set [subscriptionId]`), and with no card at all the server answers
+  `No saved card on the account: add a card in your account or use [paymentId] balance`. Earlier
+  builds of this branch required `subscriptionId` locally and threw `\InvalidArgumentException`
+  without it. `type = 'resident'` sends the package-shaped body (`paymentId`, optional `tarifId`)
+  and takes no selection — passing one throws (see Breaking).
   `enable` and `disable` answer `ids` — the proxies actually affected, the `id` of `proxyList()` —
   and `orderIds` with their orders; both lists are empty for `resident`.
 - **Optional `X-Fingerprint` on `order/make`.** Configure it as `['fingerprint' => ...]`, with

@@ -1524,8 +1524,8 @@ class Api {
      * браузер, которого у headless-клиента нет. Сам список не проверяем — за ObjectId-ом платёжки
      * её тип отсюда не виден, это сделает сервер ("Set [paymentId] from: balance / paddle_subscription").
      *
-     * subscriptionId спрашиваем только когда платёжка названа буквально paddle_subscription; в
-     * остальных случаях требование проверит сервер ("Set [subscriptionId]").
+     * subscriptionId не спрашиваем: с одной привязанной картой сервер берёт её сам, а сколько
+     * карт на аккаунте, видно только ему ("Set [subscriptionId]", если их несколько).
      *
      * @param array $json
      * @throws \InvalidArgumentException
@@ -1543,12 +1543,6 @@ class Api {
                 'autoprolong: paymentId is required for calc/enable (client api answers "Set [paymentId]"), '
                 . 'only balance and paddle_subscription are accepted. Set it once via setPaymentId()/'
                 . 'setPaymentCode(), or pass paymentId/paymentCode in the options array.'
-            );
-        }
-        if ($payment === 'paddle_subscription' && !$this->isFilled($json, 'subscriptionId')) {
-            throw new \InvalidArgumentException(
-                'autoprolong: subscriptionId is required when paying with paddle_subscription '
-                . '(client api answers "Set [subscriptionId]")'
             );
         }
     }
