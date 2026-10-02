@@ -12,12 +12,6 @@ composer require proxy-seller/user-api-php:^2.0
 
 **Pin the major.** 1.x is the client for `/personal/api/v1/` and is a different API, so a bare
 `composer require proxy-seller/user-api-php` can resolve to 1.x and none of this document applies.
-2.0.0 is not tagged yet (see [CHANGELOG.md](CHANGELOG.md)); until it is, install this branch
-directly:
-
-```sh
-composer require proxy-seller/user-api-php:dev-feature/client-api-v2
-```
 
 ## Configuration
 

@@ -2,7 +2,11 @@
 
 All notable changes to this package. This project follows [Semantic Versioning](https://semver.org/).
 
-## 2.0.1 — unreleased
+2.0.0 on Packagist (2026-10-01) is the first 2.x release and contains both 2.0.0 parts below.
+They were written while v2 was still in development, when part 2 was planned as 2.0.1, and
+nothing was published in between.
+
+## 2.0.0, part 2 of 2 — 2026-10-01
 
 Catching up with server changes made after 2.0, and safety fixes made before v2 is published: a
 payment no longer goes out twice on a dropped connection, the API key no longer reaches error texts,
@@ -224,7 +228,7 @@ payments and writes succeed only on `status: "success"`.
 - `setPaymentId()` / `setPaymentCode()` are documented as client defaults that a call's payment
   overrides; the README describes the options the SDK adds to an injected client's requests.
 
-## 2.0.0 — unreleased
+## 2.0.0, part 1 of 2 — 2026-10-01
 
 Client API **v2** (`https://proxy-seller.com/personal/api/v2/`) is a different API from v1, not a
 compatible extension of it. This release targets v2 only; 1.x remains the client for
