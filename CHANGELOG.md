@@ -4,7 +4,16 @@ All notable changes to this package. This project follows [Semantic Versioning](
 
 2.0.0 on Packagist (2026-10-01) is the first 2.x release and contains both 2.0.0 parts below.
 They were written while v2 was still in development, when part 2 was planned as 2.0.1, and
-nothing was published in between.
+nothing was published in between. The 2.0.1 that was released changes documentation only.
+
+## 2.0.1 — 2026-10-02
+
+Documentation only, the code is the same as in 2.0.0.
+
+- README: the install section no longer says that 2.0.0 is not tagged and no longer suggests
+  installing the `feature/client-api-v2` branch — use `composer require proxy-seller/user-api-php:^2.0`.
+- CHANGELOG: the two sections written before the first release as "2.0.1 — unreleased" and
+  "2.0.0 — unreleased" both shipped in 2.0.0 and are titled so now.
 
 ## 2.0.0, part 2 of 2 — 2026-10-01
 
