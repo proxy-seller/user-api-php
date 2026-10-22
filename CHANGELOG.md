@@ -6,6 +6,16 @@ All notable changes to this package. This project follows [Semantic Versioning](
 They were written while v2 was still in development, when part 2 was planned as 2.0.1, and
 nothing was published in between. The 2.0.1 that was released changes documentation only.
 
+## Unreleased
+
+### Added
+
+- **`protocol` and `host` in residential exports.** `proxyDownloadResident()` takes them as two
+  new last arguments, after `$returnStream`, so existing calls keep their meaning;
+  `proxyDownload('subresident', ...)` takes them as `$filters` keys. They put the connection
+  scheme (`http` / `socks5`) and the gateway into the lines. Without them the request and the
+  lines are the same as before.
+
 ## 2.0.1 — 2026-10-02
 
 Documentation only, the code is the same as in 2.0.0.

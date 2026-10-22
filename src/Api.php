@@ -2035,11 +2035,14 @@ class Api {
      * @param string $ext - txt | csv | свой шаблон с плейсхолдерами | ''
      * @param string $proto - https | socks5 | '' (всё остальное отдаёт оба порта)
      * @param string $listId - only for resident, if not set - will return ip from all sheets
-     * @param array $filters package_key | country | ends | ext.
+     * @param array $filters package_key | country | ends | ext | protocol | host.
      *                       package_key работает ТОЛЬКО при $type = 'subresident': литеральный
      *                       маршрут /proxy/download/resident его вообще не принимает (он знает
-     *                       только listId/id/ext/maxLine), а общий /proxy/download/{type} читает
-     *                       package_key лишь при type = subresident.
+     *                       только listId/id/ext/maxLine/protocol/host), а общий
+     *                       /proxy/download/{type} читает package_key лишь при type = subresident.
+     *                       protocol (http | socks5) и host (шлюз) — схема и шлюз в строках
+     *                       резидентов, только resident и subresident; см. proxyDownloadResident().
+     *                       Это не $proto: тот выбирает порты IPv4.
      * @return string|\Psr\Http\Message\StreamInterface
      * @throws \InvalidArgumentException при package_key на $type = 'resident'
      */
@@ -2089,11 +2092,21 @@ class Api {
      * @param string $ext - txt | csv | свой шаблон с плейсхолдерами. Слеши здесь запрещены
      *                      сервером (см. assertExt), в отличие от общего /proxy/download/{type}
      * @param integer $maxLine
+     * @param bool $returnStream
+     * @param string $protocol - http | socks5: при txt строка становится
+     *                           `socks5://login:password@host:port`, csv не меняется, свой шаблон
+     *                           получает его в %protocol%; не задан — строки без схемы, как раньше.
+     *                           Логин, пароль и порты у обоих протоколов одни; socks5 несёт ещё UDP
+     *                           и HTTP/3 (QUIC) к сайтам. Это не $proto у proxyDownload(): тот
+     *                           выбирает порты IPv4. Стоит после $returnStream, чтобы не сдвинуть
+     *                           его у существующих вызовов
+     * @param string $host - шлюз: res.proxy-seller.com (по умолчанию), us.res.proxy-seller.com,
+     *                       asia.res.proxy-seller.com
      * @return string|\Psr\Http\Message\StreamInterface
      */
-    function proxyDownloadResident($id = null, $ext = null, $maxLine = null, $returnStream = false) {
+    function proxyDownloadResident($id = null, $ext = null, $maxLine = null, $returnStream = false, $protocol = null, $host = null) {
         $ext = $this->assertExt($ext, true);
-        return $this->requestRaw('GET', 'proxy/download/resident', ['query' => $this->filterNull(compact('id', 'ext', 'maxLine'))], $returnStream);
+        return $this->requestRaw('GET', 'proxy/download/resident', ['query' => $this->filterNull(compact('id', 'ext', 'maxLine', 'protocol', 'host'))], $returnStream);
     }
 
     /**
