@@ -594,6 +594,12 @@ Valid reasons: `NOT_WORK`, `INCORRECT_LOCATION`, `CANT_CHANGE_NETWORK`, `LOW_SPE
 - `residentGeo()` returns a **JSON** file (`geo.json`) with the full geo tree — countries, regions, cities, ISPs — and `residentGeoIsp()` returns `isp.json`. Neither is a zip archive.
 - `ext` on the download endpoints is `txt`, `csv` or a custom line template built from `%ip%`, `%port%`, `%login%`, `%user%`, `%password%`, `%protocol%`, `%rotation_link%`. It must be at most 250 characters and must not contain CR, LF, `/` or `\` — the server rejects those with a bare plain-text HTTP 400 outside the envelope, so the SDK validates it first. `ext` may be given positionally or inside the `$filters` array.
 - `package_key` works only on `proxyDownload('subresident', ...)`. The literal `/proxy/download/resident` route ignores it and would export the parent package instead, so passing it there throws.
+- Residential lines take the connection scheme in `protocol` (`http` or `socks5`) and the gateway in `host`: the last two arguments of `proxyDownloadResident($id, $ext, $maxLine, $returnStream, $protocol, $host)`, or the `protocol` / `host` keys of `$filters` in `proxyDownload('subresident', ...)`. With `txt` a line becomes `socks5://login:password@host:port`, `csv` keeps its columns, and a custom template gets the value in `%protocol%`; without `protocol` the lines have no scheme, as before. Login, password and ports are the same for both protocols; `socks5` also carries UDP and HTTP/3 (QUIC) to websites. Gateways: `res.proxy-seller.com` (Europe, the default), `us.res.proxy-seller.com`, `asia.res.proxy-seller.com` — pick the one closest to your server. This is not `$proto`, which selects IPv4 ports:
+
+  ```php
+  $api->proxyDownloadResident('LIST_ID', 'txt', 1000, false, 'socks5', 'us.res.proxy-seller.com');
+  $api->proxyDownload('subresident', 'txt', null, null, ['package_key' => 'PACKAGE_KEY', 'protocol' => 'http']);
+  ```
 - `prolongCalc` / `prolongMake` take addresses or proxy ids for `ipv4` / `isp` / `mobile` (one kind per call) and order ids (`order_id`) for `ipv6` / `mix` / `mix_isp`, which are renewed only as whole orders, plus a period code — see [Renewing proxies](#renewing-proxies).
 - `residentList()` returns `data` as a flat array of lists — there is no `items` wrapper.
 - `residentTrafficDetails()` takes the package key as `packageKey` **or** `key` (plus optional `login`, `date_start`, `date_end`). `package_key`, the name used across `residentsubuser/*`, is not accepted there and yields `key is required`.
